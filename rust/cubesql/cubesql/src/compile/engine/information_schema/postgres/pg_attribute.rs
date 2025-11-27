@@ -110,7 +110,9 @@ impl PgCatalogAttributeBuilder {
         // For NUMERIC: encodes precision and scale
         // For TIMESTAMP/INTERVAL: encodes fractional second precision
         // For other types: -1 (no modifier)
-        self.atttypmod.append_value(column_type.get_typmod()).unwrap();
+        self.atttypmod
+            .append_value(column_type.get_typmod())
+            .unwrap();
 
         self.attbyval.append_value(pg_typ.typbyval).unwrap();
         self.attalign.append_value(pg_typ.typalign).unwrap();

@@ -151,16 +151,16 @@ impl CubeColumnPostgresExt for CubeColumn {
 
     fn char_octet_length(&self) -> Option<u32> {
         match self.get_column_type() {
-            ColumnType::String => Some(1073741824),  // TEXT: max 1GB (2^30 bytes)
-            ColumnType::VarStr => Some(1073741824),  // VARCHAR: max 1GB (2^30 bytes)
+            ColumnType::String => Some(1073741824), // TEXT: max 1GB (2^30 bytes)
+            ColumnType::VarStr => Some(1073741824), // VARCHAR: max 1GB (2^30 bytes)
             _ => None,
         }
     }
 
     fn character_maximum_length(&self) -> Option<u32> {
         match self.get_column_type() {
-            ColumnType::String => None,   // TEXT has no maximum length
-            ColumnType::VarStr => None,   // VARCHAR maximum would need metadata
+            ColumnType::String => None, // TEXT has no maximum length
+            ColumnType::VarStr => None, // VARCHAR maximum would need metadata
             _ => None,
         }
     }

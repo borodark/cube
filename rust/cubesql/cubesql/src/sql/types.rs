@@ -144,11 +144,11 @@ impl ColumnType {
             // Default to 6 (microsecond precision as per PostgreSQL standard)
             ColumnType::Timestamp => {
                 const VARHDRSZ: i64 = 4;
-                6 + VARHDRSZ  // 6 decimal places for microseconds
+                6 + VARHDRSZ // 6 decimal places for microseconds
             }
             ColumnType::Interval(_) => {
                 const VARHDRSZ: i64 = 4;
-                6 + VARHDRSZ  // 6 decimal places for interval precision
+                6 + VARHDRSZ // 6 decimal places for interval precision
             }
             // All other types have no type modifier
             _ => -1,

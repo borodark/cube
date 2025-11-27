@@ -3,9 +3,9 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::compile::engine::information_schema::postgres::ext::CubeColumnPostgresExt;
     use crate::sql::ColumnType;
     use crate::transport::ext::CubeColumn;
-    use crate::compile::engine::information_schema::postgres::ext::CubeColumnPostgresExt;
     use datafusion::arrow::datatypes::{DataType, Field};
 
     #[test]
@@ -75,7 +75,13 @@ mod tests {
 
     #[test]
     fn test_decimal_type_mapping() {
-        let col = CubeColumn::new("cube.column", "column", None, ColumnType::Decimal(38, 10), true);
+        let col = CubeColumn::new(
+            "cube.column",
+            "column",
+            None,
+            ColumnType::Decimal(38, 10),
+            true,
+        );
 
         assert_eq!(col.get_data_type(), "numeric");
         assert_eq!(col.get_udt_name(), "numeric");
@@ -127,9 +133,7 @@ mod tests {
             "cube.column",
             "column",
             None,
-            ColumnType::Interval(
-                datafusion::arrow::datatypes::IntervalUnit::MonthDayNano
-            ),
+            ColumnType::Interval(datafusion::arrow::datatypes::IntervalUnit::MonthDayNano),
             true,
         );
 
@@ -143,9 +147,7 @@ mod tests {
             "cube.column",
             "column",
             None,
-            ColumnType::List(Box::new(
-                Field::new("item", DataType::Int64, true)
-            )),
+            ColumnType::List(Box::new(Field::new("item", DataType::Int64, true))),
             true,
         );
 
@@ -159,9 +161,7 @@ mod tests {
             "cube.column",
             "column",
             None,
-            ColumnType::List(Box::new(
-                Field::new("item", DataType::Utf8, true)
-            )),
+            ColumnType::List(Box::new(Field::new("item", DataType::Utf8, true))),
             true,
         );
 
@@ -181,9 +181,9 @@ mod tests {
     fn test_decimal_precision_extraction() {
         // Test various decimal precisions are correctly extracted
         let test_cases = vec![
-            (10, 2),   // NUMERIC(10,2)
-            (38, 10),  // NUMERIC(38,10)
-            (5, 0),    // NUMERIC(5,0)
+            (10, 2),  // NUMERIC(10,2)
+            (38, 10), // NUMERIC(38,10)
+            (5, 0),   // NUMERIC(5,0)
         ];
 
         for (precision, scale) in test_cases {
@@ -204,7 +204,8 @@ mod tests {
     #[test]
     fn test_nullable_vs_not_nullable() {
         let nullable_col = CubeColumn::new("cube.column", "column", None, ColumnType::String, true);
-        let not_nullable_col = CubeColumn::new("cube.column", "column", None, ColumnType::String, false);
+        let not_nullable_col =
+            CubeColumn::new("cube.column", "column", None, ColumnType::String, false);
 
         assert_eq!(nullable_col.is_nullable(), "YES");
         assert_eq!(not_nullable_col.is_nullable(), "NO");
@@ -226,7 +227,11 @@ mod tests {
             ("Blob", ColumnType::Blob, "bytea"),
             ("Date(false)", ColumnType::Date(false), "date"),
             ("Date(true)", ColumnType::Date(true), "date"),
-            ("Timestamp", ColumnType::Timestamp, "timestamp without time zone"),
+            (
+                "Timestamp",
+                ColumnType::Timestamp,
+                "timestamp without time zone",
+            ),
             ("Decimal(10,2)", ColumnType::Decimal(10, 2), "numeric"),
         ];
 
@@ -285,28 +290,38 @@ mod tests {
         // Double precision (float8) uses binary radix, not decimal
         let col = CubeColumn::new("cube.column", "column", None, ColumnType::Double, true);
 
-        assert_eq!(col.numeric_precision_radix(), Some(2),
-            "Double precision should use binary radix (2)");
-        assert_eq!(col.get_numeric_precision(), Some(53),
-            "Double precision has 53 bits of precision");
+        assert_eq!(
+            col.numeric_precision_radix(),
+            Some(2),
+            "Double precision should use binary radix (2)"
+        );
+        assert_eq!(
+            col.get_numeric_precision(),
+            Some(53),
+            "Double precision has 53 bits of precision"
+        );
     }
 
     #[test]
     fn test_int_types_have_no_precision_or_scale() {
         // In PostgreSQL, INTEGER types don't report numeric_precision or numeric_scale
         // Only NUMERIC/DECIMAL types do
-        let int_types = vec![
-            ColumnType::Int8,
-            ColumnType::Int32,
-            ColumnType::Int64,
-        ];
+        let int_types = vec![ColumnType::Int8, ColumnType::Int32, ColumnType::Int64];
 
         for int_type in int_types {
             let col = CubeColumn::new("cube.column", "column", None, int_type.clone(), true);
-            assert_eq!(col.get_numeric_precision(), None,
-                "Integer type {:?} should not have numeric_precision", int_type);
-            assert_eq!(col.numeric_scale(), None,
-                "Integer type {:?} should not have numeric_scale", int_type);
+            assert_eq!(
+                col.get_numeric_precision(),
+                None,
+                "Integer type {:?} should not have numeric_precision",
+                int_type
+            );
+            assert_eq!(
+                col.numeric_scale(),
+                None,
+                "Integer type {:?} should not have numeric_scale",
+                int_type
+            );
         }
     }
 }
