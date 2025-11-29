@@ -25,6 +25,7 @@ pub enum ColumnType {
 
 impl ColumnType {
     pub fn from_pg_tid(pg_type_oid: PgTypeId) -> Result<Self, CubeError> {
+        log::error!("callin from_pg_tid");
         match pg_type_oid {
             PgTypeId::TEXT | PgTypeId::VARCHAR => Ok(ColumnType::String),
             PgTypeId::FLOAT8 => Ok(ColumnType::Double),

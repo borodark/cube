@@ -1,0 +1,617 @@
+#!/bin/bash
+
+# Cube.js Development Aliases
+# Source this file in your ~/.bashrc or ~/.zshrc:
+#   source /path/to/cube/.cube-aliases
+#
+# Or manually when needed:
+#   source ./.cube-aliases
+
+# ============================================================================
+# COLORS & UTILITIES
+# ============================================================================
+
+COLOR_RESET='\033[0m'
+COLOR_BLUE='\033[0;34m'
+COLOR_GREEN='\033[0;32m'
+COLOR_YELLOW='\033[1;33m'
+COLOR_RED='\033[0;31m'
+
+_cube_echo_info() {
+  echo -e "${COLOR_BLUE}[Cube]${COLOR_RESET} $1"
+}
+
+_cube_echo_success() {
+  echo -e "${COLOR_GREEN}[Cube]${COLOR_RESET} $1"
+}
+
+_cube_echo_warn() {
+  echo -e "${COLOR_YELLOW}[Cube]${COLOR_RESET} $1"
+}
+
+_cube_echo_error() {
+  echo -e "${COLOR_RED}[Cube]${COLOR_RESET} $1"
+}
+
+# Helper function to detect if Docker container is running
+_cube_is_docker_running() {
+  docker ps -q --filter "name=cube-server" | grep -q .
+}
+
+# Helper function to get Docker container name
+_cube_get_docker_container() {
+  docker ps -q --filter "name=cube-server" | head -1
+}
+
+# ============================================================================
+# SETUP & INITIALIZATION
+# ============================================================================
+
+# Install all dependencies
+alias cube-install='_cube_echo_info "Installing dependencies..." && yarn install'
+
+# Install and link backend-native
+alias cube-setup='_cube_echo_info "Setting up Cube.js..." && \
+  yarn install && \
+  cd packages/cubejs-backend-native && \
+  yarn run native:build-debug && \
+  yarn link && \
+  cd ../.. && \
+  _cube_echo_success "Setup complete!"'
+
+# ============================================================================
+# BUILD COMMANDS
+# ============================================================================
+
+# Build all TypeScript packages
+alias cube-build='_cube_echo_info "Building TypeScript packages..." && yarn tsc'
+
+# Build with watch mode
+alias cube-watch='_cube_echo_info "Starting watch mode..." && yarn tsc:watch'
+
+# Clean build artifacts
+alias cube-clean='_cube_echo_info "Cleaning build artifacts..." && yarn clean'
+
+# Rebuild everything
+alias cube-rebuild='cube-clean && cube-build'
+
+# Build native components
+alias cube-native-build='_cube_echo_info "Building native components..." && \
+  cd packages/cubejs-backend-native && \
+  yarn run native:build-debug && \
+  _cube_echo_success "Native build complete!" && \
+  cd ../..'
+
+# Build native with Python support
+alias cube-native-build-python='_cube_echo_info "Building native components (Python)..." && \
+  cd packages/cubejs-backend-native && \
+  yarn native:build-debug-python && \
+  _cube_echo_success "Native build complete!" && \
+  cd ../..'
+
+# Link native module globally
+alias cube-link-native='_cube_echo_info "Linking native module..." && \
+  cd packages/cubejs-backend-native && \
+  yarn link && \
+  _cube_echo_success "Native module linked!" && \
+  cd ../..'
+
+# ============================================================================
+# LOCAL DEVELOPMENT
+# ============================================================================
+
+# Start development server
+alias cube-dev='yarn dev'
+
+# Start with debug logging
+alias cube-dev-debug='CUBEJS_LOG_LEVEL=debug yarn dev'
+
+# Start with trace logging
+alias cube-dev-trace='CUBEJS_LOG_LEVEL=trace yarn dev'
+
+# Start on different port
+cube-dev-port() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-dev-port <port>"
+    return 1
+  fi
+  _cube_echo_info "Starting on port $1..."
+  CUBEJS_PORT=$1 yarn dev
+}
+
+# ============================================================================
+# TESTING
+# ============================================================================
+
+# Run all tests
+alias cube-test='_cube_echo_info "Running tests..." && yarn test'
+
+# Run tests in watch mode
+alias cube-test-watch='yarn test --watch'
+
+# Run tests with coverage
+alias cube-test-coverage='yarn test --coverage'
+
+# Test specific package
+cube-test-package() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-test-package <package-name>"
+    return 1
+  fi
+  _cube_echo_info "Testing package: $1"
+  cd "packages/cubejs-$1" && yarn test && cd ../..
+}
+
+# ============================================================================
+# LINTING & CODE QUALITY
+# ============================================================================
+
+# Run all linters
+alias cube-lint='_cube_echo_info "Running linters..." && yarn lint'
+
+# Fix linting issues
+alias cube-lint-fix='_cube_echo_info "Fixing linting issues..." && yarn lint:fix'
+
+# Lint npm package.json files
+alias cube-lint-npm='_cube_echo_info "Linting package.json files..." && yarn lint:npm'
+
+# ============================================================================
+# CUBESQL / RUST COMMANDS
+# ============================================================================
+
+# Build CubeSQL
+alias cube-sql-build='_cube_echo_info "Building CubeSQL..." && \
+  cd rust/cubesql/cubesql && \
+  cargo build && \
+  _cube_echo_success "CubeSQL build complete!" && \
+  cd ../../..'
+
+# Build CubeSQL release
+alias cube-sql-release='_cube_echo_info "Building CubeSQL release..." && \
+  cd rust/cubesql/cubesql && \
+  cargo build --release && \
+  _cube_echo_success "CubeSQL release build complete!" && \
+  cd ../../..'
+
+# Run CubeSQL e2e tests
+cube-sql-test() {
+  if [ -z "$CUBESQL_TESTING_CUBE_URL" ] || [ -z "$CUBESQL_TESTING_CUBE_TOKEN" ]; then
+    _cube_echo_error "Environment variables not set:"
+    echo "  Export CUBESQL_TESTING_CUBE_URL and CUBESQL_TESTING_CUBE_TOKEN"
+    echo "  Example:"
+    echo "    export CUBESQL_TESTING_CUBE_URL='http://localhost:4000/cubejs-api'"
+    echo "    export CUBESQL_TESTING_CUBE_TOKEN='test-token'"
+    return 1
+  fi
+  _cube_echo_info "Running CubeSQL e2e tests..."
+  cd rust/cubesql/cubesql && cargo test --test e2e "$@" && cd ../../..
+}
+
+# Run specific CubeSQL test
+cube-sql-test-name() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-sql-test-name <test-name>"
+    return 1
+  fi
+  cube-sql-test "test_$1"
+}
+
+# Review CubeSQL snapshots
+alias cube-sql-snapshots='_cube_echo_info "Reviewing snapshots..." && \
+  cd rust/cubesql/cubesql && \
+  cargo insta review && \
+  cd ../../..'
+
+# Run CubeSQL unit tests
+alias cube-sql-unit='_cube_echo_info "Running CubeSQL unit tests..." && \
+  cd rust/cubesql/cubesql && \
+  cargo test --lib && \
+  cd ../../..'
+
+# Format Rust code
+alias cube-sql-fmt='_cube_echo_info "Formatting Rust code..." && \
+  cd rust/cubesql && \
+  cargo fmt && \
+  _cube_echo_success "Rust code formatted!" && \
+  cd ../..'
+
+# Lint Rust code
+alias cube-sql-lint='_cube_echo_info "Linting Rust code..." && \
+  cd rust/cubesql && \
+  cargo clippy && \
+  cd ../..'
+
+# Run CubeSQL with logging
+cube-sql-run() {
+  _cube_echo_info "Running CubeSQL server..."
+  cd rust/cubesql/cubesql
+  CUBESQL_CUBE_URL="${CUBESQL_CUBE_URL:-http://localhost:4000/cubejs-api}" \
+  CUBESQL_CUBE_TOKEN="${CUBESQL_CUBE_TOKEN:-test-token}" \
+  CUBESQL_LOG_LEVEL="${CUBESQL_LOG_LEVEL:-debug}" \
+  CUBESQL_BIND_ADDR="0.0.0.0:5432" \
+  cargo run --bin cubesqld
+  cd ../../..
+}
+
+# ============================================================================
+# DOCKER COMMANDS
+# ============================================================================
+
+# Build Docker image for development
+cube-docker-build() {
+  _cube_echo_info "Building Docker image..."
+  docker build -f packages/cubejs-docker/Dockerfile -t cube-dev:local .
+  _cube_echo_success "Docker image built!"
+}
+
+# Start Docker compose stack
+alias cube-docker-up='_cube_echo_info "Starting Docker Compose..." && docker-compose up --build'
+
+# Start Docker compose in background
+alias cube-docker-up-d='_cube_echo_info "Starting Docker Compose (detached)..." && docker-compose up -d --build'
+
+# Stop Docker compose
+alias cube-docker-down='_cube_echo_info "Stopping Docker Compose..." && docker-compose down'
+
+# View Docker compose logs
+alias cube-docker-logs='docker-compose logs -f cube'
+
+# View all Docker compose logs
+alias cube-docker-logs-all='docker-compose logs -f'
+
+# Connect to Docker container
+cube-docker-shell() {
+  if ! _cube_is_docker_running; then
+    _cube_echo_error "Docker container 'cube-server' is not running"
+    return 1
+  fi
+  local container=$(_cube_get_docker_container)
+  _cube_echo_info "Connecting to container $container..."
+  docker exec -it "$container" /bin/bash
+}
+
+# Run command in Docker container
+cube-docker-exec() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-docker-exec <command>"
+    return 1
+  fi
+  if ! _cube_is_docker_running; then
+    _cube_echo_error "Docker container 'cube-server' is not running"
+    return 1
+  fi
+  local container=$(_cube_get_docker_container)
+  docker exec -it "$container" "$@"
+}
+
+# Run yarn in Docker container
+cube-docker-yarn() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-docker-yarn <command>"
+    return 1
+  fi
+  cube-docker-exec yarn "$@"
+}
+
+# Run npm in Docker container
+cube-docker-npm() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-docker-npm <command>"
+    return 1
+  fi
+  cube-docker-exec npm "$@"
+}
+
+# Run node in Docker container
+cube-docker-node() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-docker-node <command>"
+    return 1
+  fi
+  cube-docker-exec node "$@"
+}
+
+# ============================================================================
+# DATABASE COMMANDS
+# ============================================================================
+
+# Start PostgreSQL in Docker (for testing)
+cube-postgres-start() {
+  local name="${1:-cube-postgres}"
+  local port="${2:-5432}"
+  _cube_echo_info "Starting PostgreSQL container '$name' on port $port..."
+  docker run -d \
+    --name "$name" \
+    -e POSTGRES_USER=cubejs \
+    -e POSTGRES_PASSWORD=password123 \
+    -e POSTGRES_DB=cubejs_dev \
+    -p "$port:5432" \
+    postgres:14-alpine
+  _cube_echo_success "PostgreSQL started!"
+}
+
+# Stop PostgreSQL container
+cube-postgres-stop() {
+  local name="${1:-cube-postgres}"
+  _cube_echo_info "Stopping PostgreSQL container '$name'..."
+  docker stop "$name" && docker rm "$name"
+  _cube_echo_success "PostgreSQL stopped!"
+}
+
+# Connect to PostgreSQL
+cube-postgres-connect() {
+  local host="${1:-localhost}"
+  local port="${2:-5432}"
+  _cube_echo_info "Connecting to PostgreSQL at $host:$port..."
+  psql -h "$host" -U cubejs -d cubejs_dev -W
+}
+
+# ============================================================================
+# PROJECT SETUP HELPERS
+# ============================================================================
+
+# Create minimal test project
+cube-new-project() {
+  if [ -z "$1" ]; then
+    _cube_echo_error "Usage: cube-new-project <project-name>"
+    return 1
+  fi
+
+  local name="$1"
+  local db_type="${2:-duckdb}"
+
+  _cube_echo_info "Creating new Cube.js project: $name"
+
+  mkdir -p "$name"
+  cd "$name"
+
+  cat > package.json <<EOF
+{
+  "name": "$name",
+  "private": true,
+  "scripts": {
+    "dev": "cubejs-server",
+    "build": "cubejs build"
+  },
+  "devDependencies": {
+    "@cubejs-backend/server": "*",
+    "@cubejs-backend/${db_type}-driver": "*"
+  }
+}
+EOF
+
+  cat > cube.js <<'EOF'
+module.exports = {
+  processUnnestArrayWithLabel: true,
+};
+EOF
+
+  mkdir -p schema
+  cat > schema/Orders.js <<'EOF'
+cube(`Orders`, {
+  sql: `SELECT * FROM (
+    SELECT 1 as id, 'pending' as status, 100 as amount
+    UNION ALL
+    SELECT 2 as id, 'completed' as status, 200 as amount
+    UNION ALL
+    SELECT 3 as id, 'pending' as status, 150 as amount
+  )`,
+
+  dimensions: {
+    id: {
+      sql: `id`,
+      type: `number`,
+      primaryKey: true
+    },
+    status: {
+      sql: `status`,
+      type: `string`
+    }
+  },
+
+  measures: {
+    count: {
+      type: `count`
+    },
+    totalAmount: {
+      sql: `amount`,
+      type: `sum`
+    }
+  }
+});
+EOF
+
+  if [ "$db_type" != "duckdb" ]; then
+    cat > .env <<EOF
+CUBEJS_DB_TYPE=$db_type
+CUBEJS_DB_HOST=localhost
+CUBEJS_DB_PORT=5432
+CUBEJS_DB_USER=cubejs
+CUBEJS_DB_PASS=password123
+CUBEJS_DB_NAME=cubejs_dev
+CUBEJS_DEV_MODE=true
+CUBEJS_LOG_LEVEL=debug
+NODE_ENV=development
+EOF
+  fi
+
+  _cube_echo_success "Project '$name' created!"
+  _cube_echo_info "To get started:"
+  echo "  cd $name"
+  echo "  yarn link \"@cubejs-backend/native\""
+  echo "  yarn install"
+  echo "  yarn dev"
+}
+
+# ============================================================================
+# UTILITY COMMANDS
+# ============================================================================
+
+# Show all available aliases
+cube-help() {
+  cat <<'EOF'
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    CUBE.JS DEVELOPMENT ALIASES                             ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+SETUP & INITIALIZATION
+  cube-install              Install all dependencies
+  cube-setup                Full setup (install + build native + link)
+  cube-new-project NAME     Create a new test project
+
+BUILD COMMANDS
+  cube-build                Build all TypeScript packages
+  cube-watch                Watch mode for TypeScript
+  cube-clean                Clean build artifacts
+  cube-rebuild              Clean and rebuild
+  cube-native-build         Build native components
+  cube-native-build-python  Build native with Python support
+  cube-link-native          Link native module globally
+
+LOCAL DEVELOPMENT
+  cube-dev                  Start development server
+  cube-dev-debug            Start with debug logging
+  cube-dev-trace            Start with trace logging
+  cube-dev-port PORT        Start on specific port
+
+TESTING
+  cube-test                 Run all tests
+  cube-test-watch           Run tests in watch mode
+  cube-test-coverage        Run tests with coverage
+  cube-test-package NAME    Test specific package
+
+LINTING & CODE QUALITY
+  cube-lint                 Run all linters
+  cube-lint-fix             Fix linting issues
+  cube-lint-npm             Lint package.json files
+
+CUBESQL / RUST
+  cube-sql-build            Build CubeSQL
+  cube-sql-release          Build CubeSQL release
+  cube-sql-test             Run CubeSQL e2e tests
+  cube-sql-test-name NAME   Run specific test
+  cube-sql-snapshots        Review CubeSQL snapshots
+  cube-sql-unit             Run CubeSQL unit tests
+  cube-sql-fmt              Format Rust code
+  cube-sql-lint             Lint Rust code
+  cube-sql-run              Run CubeSQL server
+
+DOCKER
+  cube-docker-build         Build Docker image
+  cube-docker-up            Start Docker Compose
+  cube-docker-up-d          Start Docker Compose (detached)
+  cube-docker-down          Stop Docker Compose
+  cube-docker-logs          View Docker logs
+  cube-docker-logs-all      View all Docker logs
+  cube-docker-shell         Connect to Docker container
+  cube-docker-exec CMD      Run command in Docker
+  cube-docker-yarn CMD      Run yarn in Docker
+  cube-docker-npm CMD       Run npm in Docker
+  cube-docker-node CMD      Run node in Docker
+
+DATABASE
+  cube-postgres-start       Start PostgreSQL container
+  cube-postgres-stop        Stop PostgreSQL container
+  cube-postgres-connect     Connect to PostgreSQL
+
+UTILITIES
+  cube-help                 Show this help message
+
+ENVIRONMENT VARIABLES (for CubeSQL testing)
+  export CUBESQL_TESTING_CUBE_URL="http://localhost:4000/cubejs-api"
+  export CUBESQL_TESTING_CUBE_TOKEN="test-token"
+
+QUICK START
+  1. cube-setup             # First-time setup
+  2. cube-dev               # Start development server
+  3. In another terminal: cube-sql-run  # Start CubeSQL
+  4. In another terminal: cube-sql-test # Run e2e tests
+
+EOF
+}
+
+# Show current Cube.js setup info
+cube-info() {
+  _cube_echo_info "Cube.js Development Environment Info"
+  echo ""
+  echo "Node.js version:"
+  node --version
+  echo ""
+  echo "Yarn version:"
+  yarn --version
+  echo ""
+  echo "Rust version:"
+  rustc --version
+  echo ""
+  echo "Cargo version:"
+  cargo --version
+  echo ""
+  echo "Current directory:"
+  pwd
+  echo ""
+  echo "Docker running:"
+  if _cube_is_docker_running; then
+    _cube_echo_success "Yes"
+  else
+    _cube_echo_warn "No"
+  fi
+}
+
+# ============================================================================
+# COMPOSITE COMMANDS
+# ============================================================================
+
+# Full development setup
+cube-full-setup() {
+  _cube_echo_info "Running full Cube.js setup..."
+  _cube_echo_info "Step 1/5: Installing dependencies"
+  yarn install || return 1
+
+  _cube_echo_info "Step 2/5: Building TypeScript"
+  yarn tsc || return 1
+
+  _cube_echo_info "Step 3/5: Building native components"
+  cd packages/cubejs-backend-native || return 1
+  yarn run native:build-debug || return 1
+  yarn link || return 1
+  cd ../.. || return 1
+
+  _cube_echo_info "Step 4/5: Running tests"
+  yarn test || return 1
+
+  _cube_echo_info "Step 5/5: Linting code"
+  yarn lint || return 1
+
+  _cube_echo_success "Full setup complete!"
+}
+
+# Quick development workflow
+cube-quick-dev() {
+  _cube_echo_info "Quick dev workflow:"
+  _cube_echo_info "1. Building..."
+  yarn tsc || return 1
+  _cube_echo_info "2. Starting development server..."
+  yarn dev
+}
+
+# CI-like full test
+cube-ci-test() {
+  _cube_echo_info "Running CI-like tests..."
+
+  _cube_echo_info "Building..."
+  yarn tsc || return 1
+
+  _cube_echo_info "Linting..."
+  yarn lint || return 1
+
+  _cube_echo_info "Testing..."
+  yarn test || return 1
+
+  _cube_echo_success "All CI tests passed!"
+}
+
+# ============================================================================
+# EXPORTS
+# ============================================================================
+
+_cube_echo_success ".cube-aliases loaded! Run 'cube-help' for available commands."
