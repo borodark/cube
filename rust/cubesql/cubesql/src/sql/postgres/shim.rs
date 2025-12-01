@@ -401,6 +401,8 @@ impl AsyncPostgresShim {
             return Ok(());
         }
 
+        trace!("RUN_ON! ....");
+
         self.ready().await?;
 
         // When an error is detected while processing any extended-query message, the backend issues ErrorResponse,

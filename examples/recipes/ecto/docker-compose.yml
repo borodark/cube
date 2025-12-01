@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: docker.io/postgres:alpine
+    image: docker.io/postgres:14
     restart: always
     command: -c 'max_connections=1024'
     environment:
