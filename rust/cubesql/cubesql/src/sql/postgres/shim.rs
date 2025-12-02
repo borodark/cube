@@ -339,7 +339,7 @@ impl AsyncPostgresShim {
                     if source.kind() == ErrorKind::BrokenPipe
                         || source.kind() == ErrorKind::UnexpectedEof
                     {
-                        trace!("Error during processing PostgreSQL connection: {}", e);
+                        trace!("MIne GOD: Error during processing PostgreSQL connection: {}", e);
 
                         return Ok(());
                     }
@@ -400,6 +400,8 @@ impl AsyncPostgresShim {
         {
             return Ok(());
         }
+
+        trace!("RUN_ON! ....");
 
         self.ready().await?;
 
