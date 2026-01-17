@@ -20,3 +20,4 @@ bin/
 .cubestore/
 .venv/
 /__pycache__*
+/packages/cubejs-server/oclif.manifest.json

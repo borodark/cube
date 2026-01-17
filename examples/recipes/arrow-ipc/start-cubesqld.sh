@@ -107,11 +107,14 @@ echo "  $CUBESQLD_BIN"
 CUBE_API_URL="http://localhost:${CUBE_API_PORT}/cubejs-api"
 CUBE_TOKEN="${CUBESQL_CUBE_TOKEN:-test}"
 
+
+export CUBEJS_PG_SQL_PORT="${PG_SQL_PORT}"
+export CUBEJS_ADBC_PORT="${ADBC_PORT}"
+
 export CUBESQL_CUBE_URL="${CUBE_API_URL}"
 export CUBESQL_CUBE_TOKEN="${CUBE_TOKEN}"
-export CUBEJS_ADBC_PORT="${ADBC_PORT}"
 export CUBESQL_LOG_LEVEL="${CUBESQL_LOG_LEVEL:-error}"
-export CUBESTORE_LOG_LEVEL="error"
+export CUBESTORE_LOG_LEVEL="${CUBESTORE_LOG_LEVEL:-error}"
 
 # Enable Arrow Results Cache (default: true, can be overridden)
 export CUBESQL_ARROW_RESULTS_CACHE_ENABLED="${CUBESQL_ARROW_RESULTS_CACHE_ENABLED:-true}"
@@ -141,4 +144,4 @@ cleanup() {
 trap cleanup EXIT
 
 # Run cubesqld
-exec "$CUBESQLD_BIN"
+exec "$CUBESQLD_BIN" 2>&1 | tee cube-sqld.log
