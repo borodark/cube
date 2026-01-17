@@ -11,6 +11,13 @@ static SIGMA_WORKAROUND: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)^\s*with\s+nsp\sas\s\(.*nspname\s=\s.*\),\s+tbl\sas\s\(.*relname\s=\s.*\).*select\s+attname.*from\spg_attribute.*$"#).unwrap()
 });
 
+// psql \d <table> workaround - qualified operator syntax
+// Matches: OPERATOR(pg_catalog.~) or OPERATOR(pg_catalog.~*) etc.
+// Captures the operator: ~, ~*, !~, !~*
+static QUALIFIED_OPERATOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"OPERATOR\s*\(\s*pg_catalog\s*\.\s*(!?~\*?)\s*\)"#).unwrap()
+});
+
 pub fn parse_sql_to_statements(
     query: &str,
     protocol: DatabaseProtocol,
@@ -179,6 +186,11 @@ pub fn parse_sql_to_statements(
     // DataGrip CTID workaround
     let query = query.replace("SELECT t.*, CTID\nFROM ", "SELECT t.*, NULL AS ctid\nFROM ");
 
+    // psql \d <table> workaround
+    // Converts OPERATOR(pg_catalog.~) to just ~ (regex match operator)
+    // This syntax is used by psql for pattern matching in introspection queries
+    let query = QUALIFIED_OPERATOR_RE.replace_all(&query, "$1").to_string();
+
     if let Some(qtrace) = qtrace {
         qtrace.set_replaced_query(&query)
     }
@@ -281,6 +293,34 @@ mod tests {
         match result {
             Ok(_) => {}
             Err(err) => panic!("{}", err),
+        }
+    }
+
+    #[test]
+    fn test_qualified_operator_workaround() {
+        // Simulates psql \d <table> query pattern
+        let query = r#"SELECT c.relname FROM pg_catalog.pg_class c
+            WHERE c.relname OPERATOR(pg_catalog.~) '^(orders)$' COLLATE pg_catalog.default"#;
+
+        let result = parse_sql_to_statement(query, DatabaseProtocol::PostgreSQL, &mut None);
+
+        assert!(result.is_ok(), "Should parse qualified operator syntax");
+    }
+
+    #[test]
+    fn test_qualified_operator_variants() {
+        // Test all regex operator variants
+        for op in ["~", "~*", "!~", "!~*"] {
+            let query = format!(
+                "SELECT * FROM t WHERE col OPERATOR(pg_catalog.{}) 'pattern'",
+                op
+            );
+            let result = parse_sql_to_statement(&query, DatabaseProtocol::PostgreSQL, &mut None);
+            assert!(
+                result.is_ok(),
+                "Should parse OPERATOR(pg_catalog.{})",
+                op
+            );
         }
     }
 }

@@ -103,4 +103,5 @@ trap cleanup EXIT
 
 # Run Cube.js API server
 env | grep CUBE | sort
+# MORE OF ^^^^^^^^^ This
 exec yarn dev 2>&1 | tee cube-api.log
