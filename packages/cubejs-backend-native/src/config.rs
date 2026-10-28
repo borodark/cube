@@ -112,6 +112,7 @@ pub struct NodeConfigurationImpl {
 pub struct NodeConfigurationFactoryOptions {
     pub gateway_port: Option<u16>,
     pub pg_port: Option<u16>,
+    pub arrow_native_port: Option<u16>,
     /// Development mode as server-core resolved it, which CUBEJS_DEV_MODE alone cannot
     /// express: CreateOptions.devServer wins over the variable and never reaches an
     /// environment read. Absent when the embedder did not supply one.
@@ -136,6 +137,9 @@ impl NodeConfiguration for NodeConfigurationImpl {
         let config = config.update_config(|mut c| {
             if let Some(p) = options.pg_port {
                 c.postgres_bind_address = Some(format!("0.0.0.0:{}", p));
+            };
+            if let Some(p) = options.arrow_native_port {
+                c.arrow_native_bind_address = Some(format!("0.0.0.0:{}", p));
             };
 
             // Config::default() can only see CUBEJS_DEV_MODE, so without this the SQL API

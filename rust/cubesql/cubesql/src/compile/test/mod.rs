@@ -1185,7 +1185,7 @@ pub struct TestTransportSqlCall {
 }
 
 #[derive(Debug)]
-struct TestConnectionTransport {
+pub(crate) struct TestConnectionTransport {
     // Replaced to simulate a model compiled again
     meta_context: std::sync::RwLock<Arc<MetaContext>>,
     load_mocks: tokio::sync::Mutex<Vec<(TransportLoadRequestQuery, TransportLoadResponseColumnar)>>,

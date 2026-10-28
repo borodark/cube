@@ -30,6 +30,7 @@ export type SQLServerOptions = {
   canSwitchSqlUser?: CanSwitchSQLUserFn,
   sqlPort?: number,
   pgSqlPort?: number,
+  arrowNativePort?: number,
   sqlUser?: string,
   sqlSuperUser?: string,
   sqlPassword?: string,
@@ -167,6 +168,7 @@ export class SQLServer {
     this.sqlInterfaceInstance = await registerInterface({
       gatewayPort: this.gatewayPort,
       pgPort: options.pgSqlPort,
+      arrowNativePort: options.arrowNativePort,
       devServer: this.devServer,
       contextToApiScopes: async ({ securityContext }) => this.apiGateway.contextToApiScopesFn(
         securityContext,

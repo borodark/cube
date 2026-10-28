@@ -49,7 +49,7 @@ type RequireOne<T, K extends keyof T> = {
 export class CubejsServer {
   protected readonly core: CubeCore;
 
-  protected readonly config: RequireOne<CreateOptions, 'webSockets' | 'http' | 'sqlPort' | 'pgSqlPort' | 'serverHeadersTimeout' | 'serverKeepAliveTimeout'>;
+  protected readonly config: RequireOne<CreateOptions, 'webSockets' | 'http' | 'sqlPort' | 'pgSqlPort' | 'arrowNativePort' | 'serverHeadersTimeout' | 'serverKeepAliveTimeout'>;
 
   protected server: GracefulHttpServer | null = null;
 
@@ -65,6 +65,7 @@ export class CubejsServer {
       webSockets: config.webSockets || getEnv('webSockets'),
       sqlPort: config.sqlPort || getEnv('sqlPort'),
       pgSqlPort: config.pgSqlPort || getEnv('pgSqlPort'),
+      arrowNativePort: config.arrowNativePort || getEnv('arrowNativePort'),
       gatewayPort: config.gatewayPort || getEnv('nativeApiGatewayPort'),
       serverHeadersTimeout: config.serverHeadersTimeout ?? getEnv('serverHeadersTimeout'),
       serverKeepAliveTimeout: config.serverKeepAliveTimeout ?? getEnv('serverKeepAliveTimeout'),
@@ -113,7 +114,7 @@ export class CubejsServer {
         this.socketServer.initServer(this.server);
       }
 
-      if (this.config.sqlPort || this.config.pgSqlPort) {
+      if (this.config.sqlPort || this.config.pgSqlPort || this.config.arrowNativePort) {
         this.sqlServer = this.core.initSQLServer();
         await this.sqlServer.init(this.config);
       }

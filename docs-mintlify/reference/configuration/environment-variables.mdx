@@ -60,6 +60,15 @@ different for multitenant setups.
 | --------------- | ---------------------- | --------------------- |
 | A valid string  | `cubejs`               | `cubejs`              |
 
+## `CUBEJS_ARROW_NATIVE_PORT`
+
+The port used by the [SQL API][ref-sql-api] to listen to Arrow Native
+connections on. The endpoint is disabled unless this variable is set.
+
+| Possible Values              | Default in Development | Default in Production |
+| ---------------------------- | ---------------------- | --------------------- |
+| A valid port number, `false` | N/A                    | N/A                   |
+
 ## `CUBEJS_AUTO_RUN_MODE`
 
 The deployment-wide default for whether [Explore](/docs/explore-analyze/explore)
