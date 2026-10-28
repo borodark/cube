@@ -1,3 +1,4 @@
+pub mod arrow_native;
 pub(crate) mod auth_service;
 pub mod compiler_cache;
 pub(crate) mod database_variables;
@@ -11,6 +12,7 @@ pub(crate) mod temp_tables;
 pub(crate) mod types;
 
 // Public API
+pub use arrow_native::ArrowNativeServer;
 pub use auth_service::{
     AuthContext, AuthContextRef, AuthenticateResponse, HttpAuthContext, SqlAuthDefaultImpl,
     SqlAuthService, SqlAuthServiceAuthenticateRequest,

@@ -1183,7 +1183,7 @@ pub struct TestTransportSqlCall {
 }
 
 #[derive(Debug)]
-struct TestConnectionTransport {
+pub(crate) struct TestConnectionTransport {
     meta_context: Arc<MetaContext>,
     load_mocks: tokio::sync::Mutex<Vec<(TransportLoadRequestQuery, TransportLoadResponseColumnar)>>,
     load_calls: tokio::sync::Mutex<Vec<TestTransportLoadCall>>,

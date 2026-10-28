@@ -24,6 +24,7 @@ The SQL API supports the following transports:
 | --- | --- | --- |
 | Postgres | Same protocol that is used by the `psql` utility and other Postgres clients | Use by default |
 | HTTP | JSON-based protocol that is also used by the [REST (JSON) API][ref-rest-api] | Use when you need to run a SQL API query from an embedded analytics application and REST (JSON) API is not an option |
+| Arrow Native | Binary protocol that returns results as [Apache Arrow][link-arrow] record batches | Use when the client processes results as Arrow data, e.g., in a data frame |
 
 ### Postgres protocol
 
@@ -90,6 +91,20 @@ curl \
 ```
 
 See the [`/v1/cubesql` endpoint][ref-rest-api-cubesql] reference for more details.
+
+### Arrow Native protocol
+
+The Arrow Native protocol is disabled by default. To enable it, set
+[`CUBEJS_ARROW_NATIVE_PORT`](/reference/configuration/environment-variables#cubejs_arrow_native_port).
+
+Connections are authenticated with the same user name and password as over the
+Postgres protocol, and queries are planned and executed the same way. Each result
+is sent as an Arrow IPC schema followed by record batches. Statements that don't
+return query results, such as `CREATE TEMPORARY TABLE`, are not supported.
+
+The protocol is specific to Cube: each message is a length-prefixed frame.
+Generic ADBC or Arrow Flight SQL clients can't connect to it. The message
+format is described in [`protocol.rs`][link-arrow-native-protocol].
 
 ## Fundamentals
 
@@ -277,6 +292,8 @@ Use the following environment variables to allocate more resources for query pla
 [link-egg]: https://github.com/egraphs-good/egg
 [link-egraphs]: https://docs.rs/egg/latest/egg/tutorials/_01_background/index.html
 [link-psql]: https://www.postgresql.org/docs/current/app-psql.html
+[link-arrow]: https://arrow.apache.org
+[link-arrow-native-protocol]: https://github.com/cube-js/cube/blob/master/rust/cubesql/cubesql/src/sql/arrow_native/protocol.rs
 [link-postgres-information-schema]: https://www.postgresql.org/docs/16/information-schema.html
 [link-postgres-backslash-commands]: https://www.postgresql.org/docs/current/app-psql.html#APP-PSQL-META-COMMANDS
 [postgres-protocol]: https://www.postgresql.org/docs/current/protocol.html

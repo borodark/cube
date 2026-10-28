@@ -2234,6 +2234,15 @@ const variables: Record<string, (...args: any) => any> = {
 
     return undefined;
   },
+  // Arrow Native endpoint of the SQL API, disabled unless set
+  arrowNativePort: () => {
+    const port = asFalseOrPort(process.env.CUBEJS_ARROW_NATIVE_PORT || 'false', 'CUBEJS_ARROW_NATIVE_PORT');
+    if (port) {
+      return port;
+    }
+
+    return undefined;
+  },
   nativeApiGatewayPort: () => {
     if (process.env.CUBEJS_NATIVE_API_GATEWAY_PORT === 'false') {
       return undefined;
