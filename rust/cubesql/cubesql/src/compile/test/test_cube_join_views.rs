@@ -700,7 +700,7 @@ async fn test_inner_join_on_date_trunc_group_by_date_trunc() {
         r#"
             SELECT DATE_TRUNC('day', c.created_at), measure(o.revenue)
             FROM customers_view c
-            LEFT JOIN orders_view o
+            JOIN orders_view o
                 ON DATE_TRUNC('day', o.created_at) = DATE_TRUNC('day', c.created_at)
             GROUP BY 1
             "#,
@@ -726,6 +726,52 @@ async fn test_inner_join_on_date_trunc_group_by_date_trunc() {
                 set_filter("orders_view.created_at"),
                 set_filter("customers_view.created_at"),
             ]),
+            join_hints: Some(vec![vec![
+                "customers_view".to_string(),
+                "orders_view".to_string(),
+            ]]),
+            ..Default::default()
+        }
+    )
+}
+
+/// A LEFT join on `DATE_TRUNC('day', ...)`, which the SQL planner lowers to a
+/// join on a truncated key computed on each side, merges into a single
+/// multi-fact CubeScan too. Only the left truncated key is marked present.
+#[tokio::test]
+async fn test_left_join_on_date_trunc_group_by_date_trunc() {
+    if !Rewriter::sql_push_down_enabled() {
+        return;
+    }
+    init_testing_logger();
+
+    let logical_plan = plan_view_join(
+        r#"
+            SELECT DATE_TRUNC('day', c.created_at), measure(o.revenue)
+            FROM customers_view c
+            LEFT JOIN orders_view o
+                ON DATE_TRUNC('day', o.created_at) = DATE_TRUNC('day', c.created_at)
+            GROUP BY 1
+            "#,
+        true,
+    )
+    .await
+    .unwrap()
+    .as_logical_plan();
+
+    assert_eq!(
+        logical_plan.find_cube_scan().request,
+        V1LoadRequestQuery {
+            measures: Some(vec!["orders_view.revenue".to_string()]),
+            dimensions: Some(vec![]),
+            segments: Some(vec![]),
+            time_dimensions: Some(vec![V1LoadRequestQueryTimeDimension {
+                dimension: "customers_view.created_at".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: None,
+            }]),
+            order: Some(vec![]),
+            filters: Some(vec![set_filter("customers_view.created_at")]),
             join_hints: Some(vec![vec![
                 "customers_view".to_string(),
                 "orders_view".to_string(),

@@ -770,6 +770,28 @@ impl RewriteRules for MemberRules {
                 ),
                 multi_fact_join_wrapper(filter("?filter_expr", "?wrapped_input"), "?join_members"),
             ),
+            // Push a Projection without an alias down through the wrapper in the
+            // same way. The SQL planner puts one on top of an outer join on
+            // expressions (`ON DATE_TRUNC(g, a.ts) = DATE_TRUNC(g, b.ts)`), to
+            // drop the key columns it computed on each side.
+            rewrite(
+                "multi-fact-join-wrapper-projection-push-down",
+                projection(
+                    "?projection_expr",
+                    multi_fact_join_wrapper("?wrapped_input", "?join_members"),
+                    "ProjectionAlias:None",
+                    "?projection_split",
+                ),
+                multi_fact_join_wrapper(
+                    projection(
+                        "?projection_expr",
+                        "?wrapped_input",
+                        "ProjectionAlias:None",
+                        "?projection_split",
+                    ),
+                    "?join_members",
+                ),
+            ),
             // Finalize: once the query is grouped and the GROUP BY matches the
             // recorded join key, drop the wrapper so the standard aggregate
             // push-down turns the merged scan into a (multi-fact) CubeScan.
@@ -3333,14 +3355,27 @@ impl MemberRules {
             if !enable_tesseract_sql_planner {
                 return false;
             }
+            // The member a join column resolves to, and its granularity if it
+            // is a truncated time dimension (`ON DATE_TRUNC(g, a.ts) =
+            // DATE_TRUNC(g, b.ts)` of an outer join, which the planner turns
+            // into keys computed on each side)
             fn dimension_member_name(
                 egraph: &mut CubeEGraph,
                 members_id: Id,
                 column: &Column,
-            ) -> Option<String> {
+            ) -> Option<(String, Option<String>)> {
                 match egraph[members_id].data.find_member_by_column(column) {
-                    Some(((_, Member::Dimension { name, .. }, _), _))
-                    | Some(((_, Member::TimeDimension { name, .. }, _), _)) => Some(name.clone()),
+                    Some(((_, Member::Dimension { name, .. }, _), _)) => Some((name.clone(), None)),
+                    Some((
+                        (
+                            _,
+                            Member::TimeDimension {
+                                name, granularity, ..
+                            },
+                            _,
+                        ),
+                        _,
+                    )) => Some((name.clone(), granularity.clone())),
                     _ => None,
                 }
             }
@@ -3361,7 +3396,13 @@ impl MemberRules {
                 .cloned()
                 .collect::<Vec<_>>();
 
-            let mut matched: Option<(String, String, Vec<String>, Vec<String>)> = None;
+            let mut matched: Option<(
+                String,
+                String,
+                Vec<String>,
+                Vec<String>,
+                Vec<Option<String>>,
+            )> = None;
             'pairs: for left_on in left_join_ons.iter() {
                 for right_on in right_join_ons.iter() {
                     if left_on.is_empty() || left_on.len() != right_on.len() {
@@ -3371,21 +3412,24 @@ impl MemberRules {
                     let mut right_cube_name: Option<String> = None;
                     let mut left_keys: Vec<String> = vec![];
                     let mut right_keys: Vec<String> = vec![];
+                    let mut granularities: Vec<Option<String>> = vec![];
                     let mut all_match = true;
                     for (left_column, right_column) in left_on.iter().zip(right_on.iter()) {
-                        let Some(left_name) =
+                        let Some((left_name, left_granularity)) =
                             dimension_member_name(egraph, subst[left_members_var], left_column)
                         else {
                             all_match = false;
                             break;
                         };
-                        let Some(right_name) =
+                        let Some((right_name, right_granularity)) =
                             dimension_member_name(egraph, subst[right_members_var], right_column)
                         else {
                             all_match = false;
                             break;
                         };
-                        if resolve_underlying(&left_name) != resolve_underlying(&right_name) {
+                        if resolve_underlying(&left_name) != resolve_underlying(&right_name)
+                            || left_granularity != right_granularity
+                        {
                             all_match = false;
                             break;
                         }
@@ -3408,20 +3452,28 @@ impl MemberRules {
                         right_cube_name = this_right_cube;
                         left_keys.push(left_name);
                         right_keys.push(right_name);
+                        granularities.push(left_granularity);
                     }
                     if all_match {
                         if let (Some(left_cube_name), Some(right_cube_name)) =
                             (left_cube_name, right_cube_name)
                         {
-                            matched =
-                                Some((left_cube_name, right_cube_name, left_keys, right_keys));
+                            matched = Some((
+                                left_cube_name,
+                                right_cube_name,
+                                left_keys,
+                                right_keys,
+                                granularities,
+                            ));
                             break 'pairs;
                         }
                     }
                 }
             }
 
-            let Some((left_cube, right_cube, shared_left_keys, shared_right_keys)) = matched else {
+            let Some((left_cube, right_cube, shared_left_keys, shared_right_keys, granularities)) =
+                matched
+            else {
                 return false;
             };
 
@@ -3457,7 +3509,8 @@ impl MemberRules {
             // already recorded on the left wrapper (for chained 3+ view joins).
             let mut join_member_names: Vec<(String, Option<String>)> = shared_left_keys
                 .iter()
-                .map(|k| (resolve_underlying(k), None))
+                .zip(granularities)
+                .map(|(k, granularity)| (resolve_underlying(k), granularity))
                 .collect();
             if let Some(prev_var) = prev_join_members_var {
                 if let Some(prev) =
