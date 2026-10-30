@@ -1,15 +1,16 @@
 use crate::{
     compile::rewrite::{
-        analysis::Member, binary_expr, cross_join, cube_scan_wrapper, filter, fun_expr,
-        is_not_null_expr, join, join_check_pull_up, join_check_push_down, join_check_stage,
-        rewrite, rewriter::CubeRewrite, rules::wrapper::WrapperRules, transforming_rewrite,
-        wrapped_select, wrapped_select_aggr_expr_empty_tail, wrapped_select_filter_expr_empty_tail,
+        analysis::Member, binary_expr, converter::LogicalPlanToLanguageConverter, cross_join,
+        cube_scan_wrapper, filter, fun_expr, is_not_null_expr, join, join_check_pull_up,
+        join_check_push_down, join_check_stage, projection, rewrite, rewriter::CubeRewrite,
+        rules::wrapper::WrapperRules, transforming_rewrite, wrapped_select,
+        wrapped_select_aggr_expr_empty_tail, wrapped_select_filter_expr_empty_tail,
         wrapped_select_group_expr_empty_tail, wrapped_select_having_expr_empty_tail,
         wrapped_select_join, wrapped_select_joins, wrapped_select_order_expr_empty_tail,
         wrapped_select_projection_expr_empty_tail, wrapped_select_subqueries_empty_tail,
         wrapped_select_window_expr_empty_tail, wrapper_pullup_replacer, wrapper_pushdown_replacer,
         wrapper_replacer_context, BinaryExprOp, ColumnExprColumn, CubeEGraph, JoinLeftOn,
-        JoinRightOn, ListType, LogicalPlanLanguage, WrappedSelectJoinJoinType,
+        JoinRightOn, ListType, LogicalPlanLanguage, ProjectionAlias, WrappedSelectJoinJoinType,
         WrappedSelectPushToCube, WrapperReplacerContextAliasToCube,
         WrapperReplacerContextGroupedSubqueries,
     },
@@ -20,10 +21,12 @@ use crate::{
 use datafusion::{
     logical_expr::{Expr, Operator},
     logical_plan::Column,
+    optimizer::utils::expr_to_columns,
     prelude::JoinType,
 };
 use egg::{Id, Subst, Var};
 use itertools::Itertools;
+use std::collections::HashSet;
 
 impl WrapperRules {
     pub fn join_rules(&self, rules: &mut Vec<CubeRewrite>) {
@@ -44,6 +47,200 @@ impl WrapperRules {
             ),
             "CubeScanWrapperFinalized:false",
         );
+        let ungrouped_join_left = cube_scan_wrapper(
+            wrapper_pullup_replacer(
+                "?left_cube_scan_input",
+                wrapper_replacer_context(
+                    // Going to use this in RHS of rule
+                    // RHS of join is grouped, so it shouldn't have any cubes or members
+                    "?left_alias_to_cube",
+                    // This check is important
+                    // Rule would place ?left_cube_scan_input to `from` position of WrappedSelect(WrappedSelectPushToCube:true)
+                    // So it need to support push-to-Cube
+                    "WrapperReplacerContextPushToCube:true",
+                    "?left_in_projection",
+                    // Going to use this in RHS of rule
+                    // RHS of join is grouped, so it shouldn't have any cubes or members
+                    "?left_cube_members",
+                    "?left_grouped_subqueries",
+                    "?left_ungrouped_scan",
+                    // Data sources must match for both sides
+                    // TODO support unrestricted data source on one side
+                    "?input_data_source",
+                ),
+            ),
+            "CubeScanWrapperFinalized:false",
+        );
+        let ungrouped_join_right = cube_scan_wrapper(
+            wrapper_pullup_replacer(
+                "?right_input",
+                wrapper_replacer_context(
+                    // Going to ignore this
+                    "?right_alias_to_cube",
+                    "?right_push_to_cube",
+                    "?right_in_projection",
+                    // Going to ignore this
+                    "?right_cube_members",
+                    "?right_grouped_subqueries",
+                    "WrapperReplacerContextUngroupedScan:false",
+                    // Data sources must match for both sides
+                    // TODO support unrestricted data source on one side
+                    "?input_data_source",
+                ),
+            ),
+            "CubeScanWrapperFinalized:false",
+        );
+        // RHS is using WrapperReplacerContextInProjection:false because only part
+        // that should have push down replacer is join condition, and it should only contain dimensions
+        // Other way of thinking about it: join condition is more like filter than projection
+        let ungrouped_join_grouped = cube_scan_wrapper(
+            wrapped_select(
+                "WrappedSelectSelectType:Projection",
+                wrapper_pullup_replacer(
+                    wrapped_select_projection_expr_empty_tail(),
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        // Can use it, because we've checked that left input allows push-to-Cube,
+                        // so it must be ungrouped, making this whole plan ungrouped
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                wrapper_pullup_replacer(
+                    wrapped_select_subqueries_empty_tail(),
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                wrapper_pullup_replacer(
+                    wrapped_select_group_expr_empty_tail(),
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                wrapper_pullup_replacer(
+                    wrapped_select_aggr_expr_empty_tail(),
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                wrapper_pullup_replacer(
+                    wrapped_select_window_expr_empty_tail(),
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                wrapper_pullup_replacer(
+                    // Can move left_cube_scan_input here without checking if it's actually CubeScan
+                    // Check for WrapperReplacerContextPushToCube:true should be enough
+                    "?left_cube_scan_input",
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                // We don't want to use list rules here, because ?right_input is already done
+                wrapped_select_joins(vec![wrapped_select_join(
+                    wrapper_pullup_replacer(
+                        &right_join_input,
+                        wrapper_replacer_context(
+                            "?left_alias_to_cube",
+                            "WrapperReplacerContextPushToCube:true",
+                            "WrapperReplacerContextInProjection:false",
+                            "?left_cube_members",
+                            "?out_grouped_subqueries",
+                            "WrapperReplacerContextUngroupedScan:true",
+                            "?input_data_source",
+                        ),
+                    ),
+                    wrapper_pushdown_replacer(
+                        "?out_join_expr",
+                        wrapper_replacer_context(
+                            "?left_alias_to_cube",
+                            // On one hand, this should be PushToCube:true, so we would only join on dimensions
+                            // On other: RHS is grouped, so any column is just a column
+                            // Right now, it is relying on grouped_subqueries + PushToCube:true, to allow both dimensions and grouped columns
+                            "WrapperReplacerContextPushToCube:true",
+                            "WrapperReplacerContextInProjection:false",
+                            "?left_cube_members",
+                            "?out_grouped_subqueries",
+                            "WrapperReplacerContextUngroupedScan:true",
+                            "?input_data_source",
+                        ),
+                    ),
+                    "?out_join_type",
+                )]),
+                wrapper_pullup_replacer(
+                    wrapped_select_filter_expr_empty_tail(),
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                wrapped_select_having_expr_empty_tail(),
+                "WrappedSelectLimit:None",
+                "WrappedSelectOffset:None",
+                wrapper_pullup_replacer(
+                    wrapped_select_order_expr_empty_tail(),
+                    wrapper_replacer_context(
+                        "?left_alias_to_cube",
+                        "WrapperReplacerContextPushToCube:true",
+                        "WrapperReplacerContextInProjection:false",
+                        "?left_cube_members",
+                        "?out_grouped_subqueries",
+                        "WrapperReplacerContextUngroupedScan:true",
+                        "?input_data_source",
+                    ),
+                ),
+                "WrappedSelectAlias:None",
+                "WrappedSelectDistinct:false",
+                // left input has WrapperReplacerContextPushToCube:true
+                // Meaning that left input itself is ungrouped CubeScan
+                // Keep it in result, rely on pull-up rules to drop it, and on flattening rules to pick it up
+                "WrappedSelectPushToCube:true",
+                // left input is WrapperReplacerContextPushToCube:true, so result must be ungrouped
+                "WrappedSelectUngroupedScan:true",
+            ),
+            "CubeScanWrapperFinalized:false",
+        );
         rules.extend(vec![
             rewrite(
                 "wrapper-pull-up-single-select-join",
@@ -61,48 +258,45 @@ impl WrapperRules {
             transforming_rewrite(
                 "wrapper-push-down-ungrouped-join-grouped",
                 join(
-                    cube_scan_wrapper(
-                        wrapper_pullup_replacer(
-                            "?left_cube_scan_input",
-                            wrapper_replacer_context(
-                                // Going to use this in RHS of rule
-                                // RHS of join is grouped, so it shouldn't have any cubes or members
-                                "?left_alias_to_cube",
-                                // This check is important
-                                // Rule would place ?left_cube_scan_input to `from` position of WrappedSelect(WrappedSelectPushToCube:true)
-                                // So it need to support push-to-Cube
-                                "WrapperReplacerContextPushToCube:true",
-                                "?left_in_projection",
-                                // Going to use this in RHS of rule
-                                // RHS of join is grouped, so it shouldn't have any cubes or members
-                                "?left_cube_members",
-                                "?left_grouped_subqueries",
-                                "?left_ungrouped_scan",
-                                // Data sources must match for both sides
-                                // TODO support unrestricted data source on one side
-                                "?input_data_source",
-                            ),
-                        ),
-                        "CubeScanWrapperFinalized:false",
+                    &ungrouped_join_left,
+                    &ungrouped_join_right,
+                    "?left_on",
+                    "?right_on",
+                    "?in_join_type",
+                    "?join_constraint",
+                    "JoinNullEqualsNull:false",
+                ),
+                ungrouped_join_grouped.clone(),
+                self.transform_ungrouped_join_grouped(
+                    "?right_input",
+                    "?left_cube_members",
+                    "?left_on",
+                    "?right_on",
+                    "?in_join_type",
+                    "?input_data_source",
+                    "?out_join_expr",
+                    "?out_join_type",
+                    "?out_grouped_subqueries",
+                ),
+            ),
+            // An outer join on an expression of each side computes the expressions in a
+            // projection under each side and joins on those columns, see `parse_join` in
+            // DataFusion. The subquery join takes the expressions themselves as its condition,
+            // which the projections are not needed for
+            transforming_rewrite(
+                "wrapper-push-down-ungrouped-join-grouped-expr-keys",
+                join(
+                    projection(
+                        "?left_projection_expr",
+                        &ungrouped_join_left,
+                        "?left_projection_alias",
+                        "ProjectionSplit:false",
                     ),
-                    cube_scan_wrapper(
-                        wrapper_pullup_replacer(
-                            "?right_input",
-                            wrapper_replacer_context(
-                                // Going to ignore this
-                                "?right_alias_to_cube",
-                                "?right_push_to_cube",
-                                "?right_in_projection",
-                                // Going to ignore this
-                                "?right_cube_members",
-                                "?right_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:false",
-                                // Data sources must match for both sides
-                                // TODO support unrestricted data source on one side
-                                "?input_data_source",
-                            ),
-                        ),
-                        "CubeScanWrapperFinalized:false",
+                    projection(
+                        "?right_projection_expr",
+                        &ungrouped_join_right,
+                        "?right_projection_alias",
+                        "ProjectionSplit:false",
                     ),
                     "?left_on",
                     "?right_on",
@@ -110,158 +304,12 @@ impl WrapperRules {
                     "?join_constraint",
                     "JoinNullEqualsNull:false",
                 ),
-                // RHS is using WrapperReplacerContextInProjection:false because only part
-                // that should have push down replacer is join condition, and it should only contain dimensions
-                // Other way of thinking about it: join condition is more like filter than projection
-                cube_scan_wrapper(
-                    wrapped_select(
-                        "WrappedSelectSelectType:Projection",
-                        wrapper_pullup_replacer(
-                            wrapped_select_projection_expr_empty_tail(),
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                // Can use it, because we've checked that left input allows push-to-Cube,
-                                // so it must be ungrouped, making this whole plan ungrouped
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        wrapper_pullup_replacer(
-                            wrapped_select_subqueries_empty_tail(),
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        wrapper_pullup_replacer(
-                            wrapped_select_group_expr_empty_tail(),
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        wrapper_pullup_replacer(
-                            wrapped_select_aggr_expr_empty_tail(),
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        wrapper_pullup_replacer(
-                            wrapped_select_window_expr_empty_tail(),
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        wrapper_pullup_replacer(
-                            // Can move left_cube_scan_input here without checking if it's actually CubeScan
-                            // Check for WrapperReplacerContextPushToCube:true should be enough
-                            "?left_cube_scan_input",
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        // We don't want to use list rules here, because ?right_input is already done
-                        wrapped_select_joins(vec![wrapped_select_join(
-                            wrapper_pullup_replacer(
-                                &right_join_input,
-                                wrapper_replacer_context(
-                                    "?left_alias_to_cube",
-                                    "WrapperReplacerContextPushToCube:true",
-                                    "WrapperReplacerContextInProjection:false",
-                                    "?left_cube_members",
-                                    "?out_grouped_subqueries",
-                                    "WrapperReplacerContextUngroupedScan:true",
-                                    "?input_data_source",
-                                ),
-                            ),
-                            wrapper_pushdown_replacer(
-                                "?out_join_expr",
-                                wrapper_replacer_context(
-                                    "?left_alias_to_cube",
-                                    // On one hand, this should be PushToCube:true, so we would only join on dimensions
-                                    // On other: RHS is grouped, so any column is just a column
-                                    // Right now, it is relying on grouped_subqueries + PushToCube:true, to allow both dimensions and grouped columns
-                                    "WrapperReplacerContextPushToCube:true",
-                                    "WrapperReplacerContextInProjection:false",
-                                    "?left_cube_members",
-                                    "?out_grouped_subqueries",
-                                    "WrapperReplacerContextUngroupedScan:true",
-                                    "?input_data_source",
-                                ),
-                            ),
-                            "?out_join_type",
-                        )]),
-                        wrapper_pullup_replacer(
-                            wrapped_select_filter_expr_empty_tail(),
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        wrapped_select_having_expr_empty_tail(),
-                        "WrappedSelectLimit:None",
-                        "WrappedSelectOffset:None",
-                        wrapper_pullup_replacer(
-                            wrapped_select_order_expr_empty_tail(),
-                            wrapper_replacer_context(
-                                "?left_alias_to_cube",
-                                "WrapperReplacerContextPushToCube:true",
-                                "WrapperReplacerContextInProjection:false",
-                                "?left_cube_members",
-                                "?out_grouped_subqueries",
-                                "WrapperReplacerContextUngroupedScan:true",
-                                "?input_data_source",
-                            ),
-                        ),
-                        "WrappedSelectAlias:None",
-                        "WrappedSelectDistinct:false",
-                        // left input has WrapperReplacerContextPushToCube:true
-                        // Meaning that left input itself is ungrouped CubeScan
-                        // Keep it in result, rely on pull-up rules to drop it, and on flattening rules to pick it up
-                        "WrappedSelectPushToCube:true",
-                        // left input is WrapperReplacerContextPushToCube:true, so result must be ungrouped
-                        "WrappedSelectUngroupedScan:true",
-                    ),
-                    "CubeScanWrapperFinalized:false",
-                ),
-                self.transform_ungrouped_join_grouped(
+                ungrouped_join_grouped.clone(),
+                self.transform_ungrouped_join_grouped_expr_keys(
+                    "?left_projection_expr",
+                    "?left_projection_alias",
+                    "?right_projection_expr",
+                    "?right_projection_alias",
                     "?right_input",
                     "?left_cube_members",
                     "?left_on",
@@ -1102,6 +1150,196 @@ impl WrapperRules {
             }
 
             return false;
+        }
+    }
+
+    /// The expressions `join_on` stands for in a join over a projection with `expr_to_alias`:
+    /// the expression a column is an alias of, or the column itself. The flag says whether
+    /// any column is an alias.
+    fn join_key_exprs(
+        expr_to_alias: &[(Expr, String, Option<bool>)],
+        join_on: &[Column],
+    ) -> (Vec<Expr>, bool) {
+        let mut any_alias = false;
+        let exprs = join_on
+            .iter()
+            .map(|column| {
+                let alias = expr_to_alias.iter().find(|(_, alias, explicit)| {
+                    column.relation.is_none() && *explicit == Some(true) && alias == &column.name
+                });
+                match alias {
+                    Some((expr, _, _)) => {
+                        any_alias = true;
+                        expr.clone()
+                    }
+                    None => Expr::Column(column.clone()),
+                }
+            })
+            .collect();
+        (exprs, any_alias)
+    }
+
+    fn transform_ungrouped_join_grouped_expr_keys(
+        &self,
+        left_projection_expr_var: &'static str,
+        left_projection_alias_var: &'static str,
+        right_projection_expr_var: &'static str,
+        right_projection_alias_var: &'static str,
+        right_input_var: &'static str,
+        left_members_var: &'static str,
+        left_on_var: &'static str,
+        right_on_var: &'static str,
+        in_join_type_var: &'static str,
+        input_data_source_var: &'static str,
+        out_join_expr_var: &'static str,
+        out_join_type_var: &'static str,
+        out_grouped_subqueries_var: &'static str,
+    ) -> impl Fn(&mut CubeEGraph, &mut Subst) -> bool {
+        let left_projection_expr_var = var!(left_projection_expr_var);
+        let left_projection_alias_var = var!(left_projection_alias_var);
+        let right_projection_expr_var = var!(right_projection_expr_var);
+        let right_projection_alias_var = var!(right_projection_alias_var);
+        let right_input_var = var!(right_input_var);
+        let left_members_var = var!(left_members_var);
+        let left_on_var = var!(left_on_var);
+        let right_on_var = var!(right_on_var);
+        let in_join_type_var = var!(in_join_type_var);
+        let input_data_source_var = var!(input_data_source_var);
+
+        let out_join_expr_var = var!(out_join_expr_var);
+        let out_join_type_var = var!(out_join_type_var);
+        let out_grouped_subqueries_var = var!(out_grouped_subqueries_var);
+
+        let meta = self.meta_context.clone();
+        let flat_list = self.config_obj.push_down_pull_up_split();
+
+        move |egraph, subst| {
+            // See `transform_ungrouped_join_grouped`
+            if egraph[subst[right_input_var]].data.joins_subqueries {
+                return false;
+            }
+
+            // An alias would qualify the columns above the join with it, and the plan the
+            // join is replaced with has the columns of the inputs
+            for alias_var in [left_projection_alias_var, right_projection_alias_var] {
+                if !var_iter!(egraph[subst[alias_var]], ProjectionAlias).any(|a| a.is_none()) {
+                    return false;
+                }
+            }
+
+            let Some(left_expr_to_alias) = egraph[subst[left_projection_expr_var]]
+                .data
+                .expr_to_alias
+                .clone()
+            else {
+                return false;
+            };
+            let Some(right_expr_to_alias) = egraph[subst[right_projection_expr_var]]
+                .data
+                .expr_to_alias
+                .clone()
+            else {
+                return false;
+            };
+
+            for left_join_on in var_iter!(egraph[subst[left_on_var]], JoinLeftOn).cloned() {
+                for right_join_on in var_iter!(egraph[subst[right_on_var]], JoinRightOn).cloned() {
+                    for in_join_type in
+                        var_list_iter!(egraph[subst[in_join_type_var]], JoinJoinType).cloned()
+                    {
+                        if !Self::is_subquery_join_type_supported(
+                            egraph,
+                            subst,
+                            &meta,
+                            input_data_source_var,
+                            &in_join_type.0,
+                            true,
+                        ) {
+                            return false;
+                        }
+
+                        let (left_exprs, left_any_alias) =
+                            Self::join_key_exprs(&left_expr_to_alias, &left_join_on);
+                        let (right_exprs, right_any_alias) =
+                            Self::join_key_exprs(&right_expr_to_alias, &right_join_on);
+                        // A join on columns only is `wrapper-push-down-ungrouped-join-grouped`
+                        if !left_any_alias && !right_any_alias {
+                            return false;
+                        }
+
+                        let mut left_columns = HashSet::new();
+                        let mut right_columns = HashSet::new();
+                        for expr in &left_exprs {
+                            if expr_to_columns(expr, &mut left_columns).is_err() {
+                                return false;
+                            }
+                        }
+                        for expr in &right_exprs {
+                            if expr_to_columns(expr, &mut right_columns).is_err() {
+                                return false;
+                            }
+                        }
+
+                        if !Self::are_join_members_supported(
+                            egraph,
+                            subst[left_members_var],
+                            &left_columns,
+                        ) {
+                            return false;
+                        }
+
+                        let right_join_alias = right_columns
+                            .iter()
+                            .filter_map(|c| c.relation.as_ref())
+                            .next()
+                            .cloned();
+                        let Some(right_join_alias) = right_join_alias else {
+                            return false;
+                        };
+
+                        let Some(join_expr) = left_exprs
+                            .into_iter()
+                            .zip(right_exprs)
+                            .map(|(left, right)| Expr::BinaryExpr {
+                                left: Box::new(left),
+                                op: Operator::Eq,
+                                right: Box::new(right),
+                            })
+                            .reduce(|acc, expr| acc.and(expr))
+                        else {
+                            return false;
+                        };
+                        let Ok(out_join_expr) =
+                            LogicalPlanToLanguageConverter::add_expr(egraph, &join_expr, flat_list)
+                        else {
+                            return false;
+                        };
+
+                        // LHS is ungrouped, RHS is grouped
+                        let out_grouped_subqueries = vec![right_join_alias];
+
+                        subst.insert(out_join_expr_var, out_join_expr);
+                        subst.insert(
+                            out_join_type_var,
+                            egraph.add(LogicalPlanLanguage::WrappedSelectJoinJoinType(
+                                WrappedSelectJoinJoinType(in_join_type.0),
+                            )),
+                        );
+                        subst.insert(
+                            out_grouped_subqueries_var,
+                            egraph.add(
+                                LogicalPlanLanguage::WrapperReplacerContextGroupedSubqueries(
+                                    WrapperReplacerContextGroupedSubqueries(out_grouped_subqueries),
+                                ),
+                            ),
+                        );
+
+                        return true;
+                    }
+                }
+            }
+
+            false
         }
     }
 

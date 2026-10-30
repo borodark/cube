@@ -959,3 +959,122 @@ LIMIT 1
     assert_eq!(request.segments.as_ref().unwrap().len(), 1);
     assert!(request.segments.as_ref().unwrap()[0].contains(r#"\"t0\".\"measure\" IS NULL"#));
 }
+
+async fn left_join_ungrouped_with_grouped_subquery_join(on: &str, grouped: &str) -> String {
+    let query_plan = convert_select_to_query_plan(
+        format!(
+            r#"
+SELECT
+    KibanaSampleDataEcommerce.customer_gender,
+    kibana_grouped.max_price
+FROM
+    KibanaSampleDataEcommerce
+LEFT JOIN {grouped} kibana_grouped
+ON {on}
+;
+            "#
+        ),
+        DatabaseProtocol::PostgreSQL,
+    )
+    .await;
+
+    let physical_plan = query_plan.as_physical_plan().await.unwrap();
+    println!(
+        "Physical plan: {}",
+        displayable(physical_plan.as_ref()).indent()
+    );
+
+    let request = query_plan
+        .as_logical_plan()
+        .find_cube_scan_wrapped_sql()
+        .request;
+
+    assert_eq!(request.ungrouped, Some(true));
+    assert_eq!(request.subquery_joins.as_ref().unwrap().len(), 1);
+
+    let subquery = &request.subquery_joins.unwrap()[0];
+
+    assert!(!subquery.sql.contains("ungrouped"));
+    assert_eq!(subquery.join_type, "LEFT");
+
+    subquery.on.clone()
+}
+
+const KIBANA_GROUPED_BY_GENDER: &str = r#"(
+    SELECT
+        customer_gender,
+        MAX(maxPrice) AS max_price
+    FROM
+        KibanaSampleDataEcommerce
+    GROUP BY 1
+)"#;
+
+/// A left join on an expression of each side is planned with the expressions computed in
+/// projections below the join. It should push down as a LEFT subquery join on the expressions
+#[tokio::test]
+async fn test_left_join_ungrouped_with_grouped_on_expression() {
+    if !Rewriter::sql_push_down_enabled() {
+        return;
+    }
+    init_testing_logger();
+
+    let on = left_join_ungrouped_with_grouped_subquery_join(
+        "LOWER(KibanaSampleDataEcommerce.customer_gender) = LOWER(kibana_grouped.customer_gender)",
+        KIBANA_GROUPED_BY_GENDER,
+    )
+    .await;
+
+    assert!(on.contains(
+        r#"LOWER(${KibanaSampleDataEcommerce.customer_gender}) = LOWER(\"kibana_grouped\".\"customer_gender\")"#
+    ));
+}
+
+/// A left join on a column and an expression should push down as a LEFT subquery join on both
+#[tokio::test]
+async fn test_left_join_ungrouped_with_grouped_on_column_and_expression() {
+    if !Rewriter::sql_push_down_enabled() {
+        return;
+    }
+    init_testing_logger();
+
+    let on = left_join_ungrouped_with_grouped_subquery_join(
+        "KibanaSampleDataEcommerce.customer_gender = kibana_grouped.customer_gender \
+         AND LOWER(KibanaSampleDataEcommerce.customer_gender) = LOWER(kibana_grouped.customer_gender)",
+        KIBANA_GROUPED_BY_GENDER,
+    )
+    .await;
+
+    assert!(on.contains(
+        r#"${KibanaSampleDataEcommerce.customer_gender} = \"kibana_grouped\".\"customer_gender\""#
+    ));
+    assert!(on.contains(
+        r#"LOWER(${KibanaSampleDataEcommerce.customer_gender}) = LOWER(\"kibana_grouped\".\"customer_gender\")"#
+    ));
+}
+
+/// A left join of a cube on a grouped subquery by day should push down as a LEFT subquery join
+/// on the day of the time dimension
+#[tokio::test]
+async fn test_left_join_ungrouped_with_grouped_on_date_trunc() {
+    if !Rewriter::sql_push_down_enabled() {
+        return;
+    }
+    init_testing_logger();
+
+    let on = left_join_ungrouped_with_grouped_subquery_join(
+        "DATE_TRUNC('day', KibanaSampleDataEcommerce.order_date) = kibana_grouped.order_day",
+        r#"(
+    SELECT
+        DATE_TRUNC('day', order_date) AS order_day,
+        MAX(maxPrice) AS max_price
+    FROM
+        KibanaSampleDataEcommerce
+    GROUP BY 1
+)"#,
+    )
+    .await;
+
+    assert!(on.contains(
+        r#"${KibanaSampleDataEcommerce.order_date.day} = \"kibana_grouped\".\"order_day\""#
+    ));
+}
