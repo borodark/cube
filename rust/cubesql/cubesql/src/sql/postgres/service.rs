@@ -89,6 +89,12 @@ impl ProcessingLoop for PostgresServer {
                 }
             };
 
+            // A response is several small messages written back to back; with
+            // Nagle's algorithm on, the client's delayed ACK stalls them ~40ms
+            if let Err(err) = socket.set_nodelay(true) {
+                error!("[pg] Unable to set TCP_NODELAY: {}", err);
+            }
+
             let (client_addr, client_port) = match socket.peer_addr() {
                 Ok(peer_addr) => (peer_addr.ip().to_string(), peer_addr.port()),
                 Err(e) => {
