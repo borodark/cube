@@ -742,7 +742,7 @@ dependencies = [
 [[package]]
 name = "cube-ext"
 version = "1.0.0"
-source = "git+https://github.com/borodark/arrow-datafusion.git?rev=35a1a936ec87a5849864975d7bafc22d1da7030d#35a1a936ec87a5849864975d7bafc22d1da7030d"
+source = "git+https://github.com/borodark/arrow-datafusion.git?rev=0921f4c32fdd1b60c33e6197b51e2bbc469e163e#0921f4c32fdd1b60c33e6197b51e2bbc469e163e"
 dependencies = [
  "arrow",
  "chrono",
@@ -866,7 +866,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "7.0.0"
-source = "git+https://github.com/borodark/arrow-datafusion.git?rev=35a1a936ec87a5849864975d7bafc22d1da7030d#35a1a936ec87a5849864975d7bafc22d1da7030d"
+source = "git+https://github.com/borodark/arrow-datafusion.git?rev=0921f4c32fdd1b60c33e6197b51e2bbc469e163e#0921f4c32fdd1b60c33e6197b51e2bbc469e163e"
 dependencies = [
  "ahash 0.7.8",
  "arrow",
@@ -899,7 +899,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "7.0.0"
-source = "git+https://github.com/borodark/arrow-datafusion.git?rev=35a1a936ec87a5849864975d7bafc22d1da7030d#35a1a936ec87a5849864975d7bafc22d1da7030d"
+source = "git+https://github.com/borodark/arrow-datafusion.git?rev=0921f4c32fdd1b60c33e6197b51e2bbc469e163e#0921f4c32fdd1b60c33e6197b51e2bbc469e163e"
 dependencies = [
  "arrow",
  "ordered-float 2.10.0",
@@ -910,7 +910,7 @@ dependencies = [
 [[package]]
 name = "datafusion-data-access"
 version = "1.0.0"
-source = "git+https://github.com/borodark/arrow-datafusion.git?rev=35a1a936ec87a5849864975d7bafc22d1da7030d#35a1a936ec87a5849864975d7bafc22d1da7030d"
+source = "git+https://github.com/borodark/arrow-datafusion.git?rev=0921f4c32fdd1b60c33e6197b51e2bbc469e163e#0921f4c32fdd1b60c33e6197b51e2bbc469e163e"
 dependencies = [
  "async-trait",
  "chrono",
@@ -923,7 +923,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "7.0.0"
-source = "git+https://github.com/borodark/arrow-datafusion.git?rev=35a1a936ec87a5849864975d7bafc22d1da7030d#35a1a936ec87a5849864975d7bafc22d1da7030d"
+source = "git+https://github.com/borodark/arrow-datafusion.git?rev=0921f4c32fdd1b60c33e6197b51e2bbc469e163e#0921f4c32fdd1b60c33e6197b51e2bbc469e163e"
 dependencies = [
  "ahash 0.7.8",
  "arrow",
@@ -934,7 +934,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "7.0.0"
-source = "git+https://github.com/borodark/arrow-datafusion.git?rev=35a1a936ec87a5849864975d7bafc22d1da7030d#35a1a936ec87a5849864975d7bafc22d1da7030d"
+source = "git+https://github.com/borodark/arrow-datafusion.git?rev=0921f4c32fdd1b60c33e6197b51e2bbc469e163e#0921f4c32fdd1b60c33e6197b51e2bbc469e163e"
 dependencies = [
  "ahash 0.7.8",
  "arrow",
