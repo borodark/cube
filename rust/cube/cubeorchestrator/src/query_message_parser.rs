@@ -19,6 +19,7 @@ use cubeshared::flatbuffers::VerifierOptions;
 use indexmap::IndexMap;
 use neon::prelude::Finalize;
 use std::io::Cursor;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -101,7 +102,12 @@ pub struct QueryResult {
     pub(crate) members: Vec<String>,
     pub(crate) columns_pos: IndexMap<String, usize>,
     pub(crate) row_count: usize,
-    pub(crate) data: Vec<ColumnarArray>,
+    /// The values of every column. A result read from Arrow fills it from
+    /// `arrow_ipc` on first use, so a reader that takes the Arrow data as it is
+    /// never pays for converting each value.
+    data: OnceLock<Result<Vec<ColumnarArray>, String>>,
+    /// The Arrow IPC stream the result was read from, if any.
+    arrow_ipc: Option<Arc<[u8]>>,
 }
 
 impl Finalize for QueryResult {}
@@ -112,7 +118,8 @@ impl QueryResult {
             members: vec![],
             columns_pos: IndexMap::new(),
             row_count: 0,
-            data: vec![],
+            data: OnceLock::from(Ok(vec![])),
+            arrow_ipc: None,
         }
     }
 
@@ -137,18 +144,21 @@ impl QueryResult {
             }
         }
 
-        let columns_pos: IndexMap<String, usize> = members
+        Ok(QueryResult {
+            columns_pos: Self::columns_pos(&members),
+            members,
+            row_count,
+            data: OnceLock::from(Ok(data)),
+            arrow_ipc: None,
+        })
+    }
+
+    fn columns_pos(members: &[String]) -> IndexMap<String, usize> {
+        members
             .iter()
             .enumerate()
             .map(|(index, member)| (member.clone(), index))
-            .collect();
-
-        Ok(QueryResult {
-            members,
-            columns_pos,
-            row_count,
-            data,
-        })
+            .collect()
     }
 
     #[inline]
@@ -161,11 +171,30 @@ impl QueryResult {
         &self.members
     }
 
+    /// The values of every column, converted from Arrow on first use.
+    pub fn data(&self) -> Result<&[ColumnarArray], ParseError> {
+        self.data
+            .get_or_init(|| match &self.arrow_ipc {
+                Some(bytes) => Self::arrow_values(bytes).map_err(|err| err.to_string()),
+                None => Ok(vec![]),
+            })
+            .as_deref()
+            .map_err(|err| ParseError::ArrowError(err.clone()))
+    }
+
+    /// The Arrow IPC stream this result was read from, for a reader that can
+    /// take Arrow as it is. `None` for a result that didn't come as Arrow.
+    #[inline]
+    pub fn arrow_ipc(&self) -> Option<&[u8]> {
+        self.arrow_ipc.as_deref()
+    }
+
     #[inline]
     pub fn column(&self, idx: usize) -> Result<&ColumnarArray, ParseError> {
-        self.data.get(idx).ok_or(ParseError::ColumnIndexOutOfRange {
+        let data = self.data()?;
+        data.get(idx).ok_or(ParseError::ColumnIndexOutOfRange {
             idx,
-            data_len: self.data.len(),
+            data_len: data.len(),
         })
     }
 
@@ -277,13 +306,47 @@ impl QueryResult {
         QueryResult::try_new(members, data)
     }
 
+    /// Reads the schema and row count of an Arrow IPC stream, and keeps the
+    /// stream to convert values from when they are asked for.
     pub(crate) fn from_arrow(bytes: &[u8]) -> Result<Self, ParseError> {
         let reader = StreamReader::try_new(Cursor::new(bytes), None)
             .map_err(|err| ParseError::ArrowError(err.to_string()))?;
 
         let schema = reader.schema();
+        // Values are converted later, so reject the types they can't be
+        // converted from now, while the error still belongs to reading the result.
+        if let Some(field) = schema
+            .fields()
+            .iter()
+            .find(|f| !is_supported_arrow_type(f.data_type()))
+        {
+            return Err(ParseError::UnsupportedArrowType(format!(
+                "{:?}",
+                field.data_type()
+            )));
+        }
+
         let members: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let n_cols = members.len();
+
+        let mut row_count = 0;
+        for batch in reader {
+            let batch = batch.map_err(|err| ParseError::ArrowError(err.to_string()))?;
+            row_count += batch.num_rows();
+        }
+
+        Ok(QueryResult {
+            columns_pos: Self::columns_pos(&members),
+            members,
+            row_count,
+            data: OnceLock::new(),
+            arrow_ipc: Some(Arc::from(bytes)),
+        })
+    }
+
+    fn arrow_values(bytes: &[u8]) -> Result<Vec<ColumnarArray>, ParseError> {
+        let reader = StreamReader::try_new(Cursor::new(bytes), None)
+            .map_err(|err| ParseError::ArrowError(err.to_string()))?;
+        let n_cols = reader.schema().fields().len();
 
         let mut columns: Vec<Vec<DBResponsePrimitive>> = (0..n_cols).map(|_| Vec::new()).collect();
 
@@ -294,8 +357,7 @@ impl QueryResult {
             }
         }
 
-        let data: Vec<ColumnarArray> = columns.into_iter().map(ColumnarArray::from).collect();
-        QueryResult::try_new(members, data)
+        Ok(columns.into_iter().map(ColumnarArray::from).collect())
     }
 }
 
@@ -332,6 +394,38 @@ fn decimal_to_string<T: std::fmt::Display>(mantissa: T, scale: u32) -> String {
     } else {
         format!("{sign}{int_part}.{frac}")
     }
+}
+
+/// Whether [`append_arrow_array`] can convert values of `data_type`.
+fn is_supported_arrow_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
 }
 
 /// Append every element of an Arrow `array` to a column accumulator, converting
@@ -598,8 +692,8 @@ mod tests {
 
         assert_eq!(query_result.members.len(), 5);
         assert_eq!(query_result.row_count, 10);
-        assert_eq!(query_result.data.len(), 5);
-        assert!(query_result.data.iter().all(|c| c.len() == 10));
+        assert_eq!(query_result.data().unwrap().len(), 5);
+        assert!(query_result.data().unwrap().iter().all(|c| c.len() == 10));
 
         Ok(())
     }
@@ -612,8 +706,8 @@ mod tests {
 
         assert_eq!(query_result.members.len(), 20);
         assert_eq!(query_result.row_count, 1000);
-        assert_eq!(query_result.data.len(), 20);
-        assert!(query_result.data.iter().all(|c| c.len() == 1000));
+        assert_eq!(query_result.data().unwrap().len(), 20);
+        assert!(query_result.data().unwrap().iter().all(|c| c.len() == 1000));
 
         Ok(())
     }
@@ -627,8 +721,12 @@ mod tests {
 
         assert_eq!(query_result.members.len(), 30);
         assert_eq!(query_result.row_count, 10_000);
-        assert_eq!(query_result.data.len(), 30);
-        assert!(query_result.data.iter().all(|c| c.len() == 10_000));
+        assert_eq!(query_result.data().unwrap().len(), 30);
+        assert!(query_result
+            .data()
+            .unwrap()
+            .iter()
+            .all(|c| c.len() == 10_000));
 
         Ok(())
     }
@@ -641,8 +739,12 @@ mod tests {
 
         assert_eq!(query_result.members.len(), 40);
         assert_eq!(query_result.row_count, 33_000);
-        assert_eq!(query_result.data.len(), 40);
-        assert!(query_result.data.iter().all(|c| c.len() == 33_000));
+        assert_eq!(query_result.data().unwrap().len(), 40);
+        assert!(query_result
+            .data()
+            .unwrap()
+            .iter()
+            .all(|c| c.len() == 33_000));
 
         Ok(())
     }
@@ -655,8 +757,12 @@ mod tests {
 
         assert_eq!(query_result.members.len(), 100);
         assert_eq!(query_result.row_count, 50_000);
-        assert_eq!(query_result.data.len(), 100);
-        assert!(query_result.data.iter().all(|c| c.len() == 50_000));
+        assert_eq!(query_result.data().unwrap().len(), 100);
+        assert!(query_result
+            .data()
+            .unwrap()
+            .iter()
+            .all(|c| c.len() == 50_000));
 
         Ok(())
     }
@@ -735,10 +841,10 @@ mod tests {
 
         assert_eq!(result.members, vec!["city", "amount", "created_at"]);
         assert_eq!(result.row_count, 3);
-        assert_eq!(result.data.len(), 3);
+        assert_eq!(result.data().unwrap().len(), 3);
 
         assert_eq!(
-            result.data[0].as_slice(),
+            result.data().unwrap()[0].as_slice(),
             &[
                 DBResponsePrimitive::String("Berlin".to_string()),
                 DBResponsePrimitive::Null,
@@ -746,7 +852,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            result.data[1].as_slice(),
+            result.data().unwrap()[1].as_slice(),
             &[
                 DBResponsePrimitive::Float64(1.5),
                 DBResponsePrimitive::Float64(2.0),
@@ -755,18 +861,21 @@ mod tests {
         );
 
         // Numeric values serialize as JSON strings, matching the legacy result set.
-        let amounts_json = serde_json::to_value(result.data[1].as_slice()).unwrap();
+        let amounts_json = serde_json::to_value(result.data().unwrap()[1].as_slice()).unwrap();
         assert_eq!(amounts_json[0], "1.5");
         assert_eq!(amounts_json[1], "2");
         assert_eq!(amounts_json[2], serde_json::Value::Null);
 
         // Timestamps land in the dedicated variant and serialize to the ISO format.
-        match &result.data[2].as_slice()[0] {
+        match &result.data().unwrap()[2].as_slice()[0] {
             DBResponsePrimitive::Timestamp(_) => {}
             other => panic!("expected Timestamp, got {other:?}"),
         }
-        assert_eq!(result.data[2].as_slice()[1], DBResponsePrimitive::Null);
-        let json = serde_json::to_value(result.data[2].as_slice()).unwrap();
+        assert_eq!(
+            result.data().unwrap()[2].as_slice()[1],
+            DBResponsePrimitive::Null
+        );
+        let json = serde_json::to_value(result.data().unwrap()[2].as_slice()).unwrap();
         assert_eq!(json[0], "1970-01-01T00:00:00.000");
         assert_eq!(json[1], serde_json::Value::Null);
         assert_eq!(json[2], "1970-01-01T00:00:01.000");
@@ -795,7 +904,7 @@ mod tests {
         let result = QueryResult::from_arrow(&bytes)?;
 
         assert_eq!(
-            result.data[0].as_slice(),
+            result.data().unwrap()[0].as_slice(),
             &[
                 DBResponsePrimitive::String("9999999999999999999999999999999999999.99".to_string()),
                 DBResponsePrimitive::Null,
@@ -828,7 +937,7 @@ mod tests {
         let result = QueryResult::from_arrow(&bytes)?;
 
         assert_eq!(result.row_count, 5);
-        let json = serde_json::to_value(result.data[0].as_slice()).unwrap();
+        let json = serde_json::to_value(result.data().unwrap()[0].as_slice()).unwrap();
         assert_eq!(json[0], serde_json::Value::Null);
         assert_eq!(json[1], "2399.96");
         assert_eq!(json[2], "2249.91");
@@ -895,16 +1004,70 @@ mod tests {
             DBResponsePrimitive::String("0x".to_string()),
         ];
         for idx in 0..3 {
-            assert_eq!(result.data[idx].as_slice(), expected.as_slice());
+            assert_eq!(result.data().unwrap()[idx].as_slice(), expected.as_slice());
         }
         assert_eq!(
-            result.data[3].as_slice(),
+            result.data().unwrap()[3].as_slice(),
             &[
                 DBResponsePrimitive::String("0xDEAD".to_string()),
                 DBResponsePrimitive::Null,
                 DBResponsePrimitive::String("0xBEEF".to_string()),
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_arrow_converts_values_on_first_use() -> Result<(), ParseError> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
+            ],
+        )
+        .unwrap();
+        let bytes = arrow_ipc_bytes(&batch);
+
+        let result = QueryResult::from_arrow(&bytes)?;
+        assert_eq!(result.row_count(), 3);
+        assert_eq!(result.members(), &["id".to_string(), "name".to_string()]);
+        assert_eq!(result.arrow_ipc(), Some(bytes.as_slice()));
+        assert!(result.data.get().is_none(), "values converted before use");
+
+        assert_eq!(
+            result.column(0)?.as_slice(),
+            &[
+                DBResponsePrimitive::Int64(1),
+                DBResponsePrimitive::Null,
+                DBResponsePrimitive::Int64(3)
+            ]
+        );
+        assert_eq!(
+            result.column(1)?.as_slice(),
+            &[
+                DBResponsePrimitive::String("a".to_string()),
+                DBResponsePrimitive::String("b".to_string()),
+                DBResponsePrimitive::Null
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_results_not_from_arrow_have_no_ipc() -> Result<(), ParseError> {
+        let result = QueryResult::try_new(
+            vec!["a".to_string()],
+            vec![ColumnarArray::from(vec![DBResponsePrimitive::Int64(1)])],
+        )?;
+        assert_eq!(result.arrow_ipc(), None);
+        assert_eq!(QueryResult::empty().arrow_ipc(), None);
 
         Ok(())
     }
@@ -980,14 +1143,14 @@ mod tests {
         assert_eq!(result.members, vec!["city", "amount"]);
         assert_eq!(result.row_count, 2);
         assert_eq!(
-            result.data[0].as_slice(),
+            result.data().unwrap()[0].as_slice(),
             &[
                 DBResponsePrimitive::String("Berlin".to_string()),
                 DBResponsePrimitive::String("Lisbon".to_string()),
             ]
         );
         assert_eq!(
-            result.data[1].as_slice(),
+            result.data().unwrap()[1].as_slice(),
             &[
                 DBResponsePrimitive::Float64(1.5),
                 DBResponsePrimitive::Float64(2.0),
@@ -1025,7 +1188,7 @@ mod tests {
         let result = QueryResult::from_cubestore_fb(&msg_data)?;
         assert!(result.members.is_empty());
         assert_eq!(result.row_count, 0);
-        assert!(result.data.is_empty());
+        assert!(result.data().unwrap().is_empty());
 
         Ok(())
     }
