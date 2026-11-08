@@ -1,3 +1,4 @@
+pub mod arrow_response;
 pub mod coerce;
 pub mod columar;
 pub mod optimizers;

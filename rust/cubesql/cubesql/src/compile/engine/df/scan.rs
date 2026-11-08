@@ -1,4 +1,5 @@
 use crate::compile::date_parser::parse_date_str;
+use crate::compile::engine::df::arrow_response::{arrow_field_values, convert_arrow_column};
 use crate::{
     compile::{
         engine::df::wrapper::{CubeScanWrappedSqlNode, CubeScanWrapperNode, SqlQuery},
@@ -319,6 +320,16 @@ pub enum FieldValue<'a> {
 
 pub trait ColumnarValueObject {
     fn len(&mut self) -> std::result::Result<usize, CubeError>;
+
+    /// The column for `field_name` as Arrow, for a response that holds Arrow
+    /// it can hand over as it is. `transform_response` then reads it in place
+    /// of [`ColumnarValueObject::column`], with the same result.
+    fn arrow_column(
+        &mut self,
+        _field_name: &str,
+    ) -> std::result::Result<Option<ArrayRef>, CubeError> {
+        Ok(None)
+    }
 
     fn column<'a>(
         &'a mut self,
@@ -1493,9 +1504,20 @@ pub fn transform_response<C: ColumnarValueObject>(
 
         let mut builder = ColumnBuilder::try_new(schema_field.data_type(), len)?;
         match &member_fields[i] {
-            MemberField::Member(member) => {
-                builder.append_column(response.column(&member.field_name)?)?;
-            }
+            MemberField::Member(member) => match response.arrow_column(&member.field_name)? {
+                Some(array) => {
+                    if let Some(column) = convert_arrow_column(&array, schema_field.data_type())? {
+                        columns.push(column);
+                        continue;
+                    }
+
+                    match arrow_field_values(&array) {
+                        Some(values) => builder.append_column(values)?,
+                        None => builder.append_column(response.column(&member.field_name)?)?,
+                    }
+                }
+                None => builder.append_column(response.column(&member.field_name)?)?,
+            },
             MemberField::Literal(value) => builder.append_literal(value, len)?,
         }
 
