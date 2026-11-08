@@ -2,9 +2,12 @@ use crate::node_obj_deserializer::JsValueDeserializer;
 use crate::transport::MapCubeErrExt;
 use cubeorchestrator::query_message_parser::QueryResult;
 use cubeorchestrator::query_result_transform::{
-    DBResponsePrimitive, RequestResultData, RequestResultDataMulti, TransformedData,
+    ColumnarSource, DBResponsePrimitive, RequestResultData, RequestResultDataMulti, TransformedData,
 };
-use cubeorchestrator::transport::{JsRawColumnarData, TransformDataRequest};
+use cubeorchestrator::transport::{JsRawColumnarData, ResultType, TransformDataRequest};
+use cubesql::compile::engine::df::arrow_response::{
+    arrow_passthrough_enabled, read_arrow_ipc, ResponseArray as ArrayRef, ResponseType as DataType,
+};
 use cubesql::compile::engine::df::scan::{ColumnarValueObject, FieldValue};
 use cubesql::CubeError;
 use neon::context::{Context, FunctionContext, ModuleContext};
@@ -36,6 +39,9 @@ pub struct ResultWrapper {
     transform_data: TransformDataRequest,
     data: Arc<QueryResult>,
     transformed_data: Option<TransformedData>,
+    /// The result's Arrow columns, for cubesql to read as they are: `None`
+    /// until first asked for, then `Some(None)` if the result can't be read so.
+    arrow: Option<Option<Arc<ArrowResult>>>,
     pub last_refresh_time: Option<String>,
     pub external: bool,
     pub used_pre_aggregations: Option<serde_json::Value>,
@@ -114,9 +120,54 @@ impl ResultWrapper {
             transform_data: transform_request,
             data: query_result,
             transformed_data: None,
+            arrow: None,
             last_refresh_time: None,
             external: false,
             used_pre_aggregations: None,
+        })
+    }
+
+    /// The result's Arrow columns and the members they map to, when the result
+    /// came from Cube Store as Arrow and `CUBESQL_ARROW_PASSTHROUGH` is on.
+    fn arrow_result(&mut self) -> Option<Arc<ArrowResult>> {
+        if self.arrow.is_none() {
+            self.arrow = Some(self.read_arrow_result().map(Arc::new));
+        }
+
+        self.arrow.clone().flatten()
+    }
+
+    fn read_arrow_result(&self) -> Option<ArrowResult> {
+        if !arrow_passthrough_enabled()
+            || self.transformed_data.is_some()
+            || !matches!(self.transform_data.res_type, Some(ResultType::Columnar))
+        {
+            return None;
+        }
+
+        let columns = match read_arrow_ipc(self.data.arrow_ipc()?) {
+            Ok(Some((_, columns))) => columns,
+            Ok(None) => return None,
+            Err(err) => {
+                log::warn!(
+                    "Can't read Cube Store result as Arrow, converting values: {}",
+                    err
+                );
+                return None;
+            }
+        };
+        if columns.len() != self.data.members().len() {
+            return None;
+        }
+
+        // An error here is the transform's own, which reading values reports
+        let (members, sources) =
+            TransformedData::columnar_sources(&self.transform_data, &self.data).ok()?;
+
+        Some(ArrowResult {
+            members,
+            sources,
+            columns,
         })
     }
 
@@ -145,8 +196,28 @@ fn db_primitive_to_field_value(value: &DBResponsePrimitive) -> FieldValue<'_> {
     }
 }
 
+/// A Cube Store result as Arrow columns, and where each member of its
+/// columnar form comes from.
+#[derive(Debug)]
+struct ArrowResult {
+    members: Vec<String>,
+    sources: Vec<ColumnarSource>,
+    columns: Vec<ArrayRef>,
+}
+
 impl ColumnarValueObject for ResultWrapper {
     fn len(&mut self) -> Result<usize, CubeError> {
+        if self.transformed_data.is_none() {
+            if let Some(arrow) = self.arrow_result() {
+                // The columnar form has a column of every row per member
+                return Ok(if arrow.members.is_empty() {
+                    0
+                } else {
+                    self.data.row_count()
+                });
+            }
+        }
+
         if self.transformed_data.is_none() {
             self.transform_result()?;
         }
@@ -159,6 +230,27 @@ impl ColumnarValueObject for ResultWrapper {
         };
 
         Ok(columns.first().map(|c| c.len()).unwrap_or(0))
+    }
+
+    fn arrow_column(&mut self, field_name: &str) -> Result<Option<ArrayRef>, CubeError> {
+        let Some(arrow) = self.arrow_result() else {
+            return Ok(None);
+        };
+        let Some(position) = arrow.members.iter().position(|m| m == field_name) else {
+            return Ok(None);
+        };
+
+        Ok(match &arrow.sources[position] {
+            ColumnarSource::Column { index, member_type } => {
+                let column = &arrow.columns[*index];
+                // Time strings are normalized as values are converted
+                let time_strings = member_type == "time"
+                    && matches!(column.data_type(), DataType::Utf8 | DataType::LargeUtf8);
+
+                (!time_strings).then(|| column.clone())
+            }
+            ColumnarSource::Other => None,
+        })
     }
 
     fn column<'a>(
