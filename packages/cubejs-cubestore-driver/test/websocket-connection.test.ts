@@ -687,6 +687,108 @@ describe('WebSocketConnection', () => {
     }, JEST_TIMEOUT);
   });
 
+  describe('streamed query', () => {
+    type Frame = { data: string, isLast: boolean };
+
+    const queryStream = (sql: string, frames: Frame[]) => connection!.queryStream(
+      sql,
+      [],
+      { responseFormat: QueryResultFormat.Arrow },
+      (message, isLast) => {
+        // The payload sits at the end of the flatbuffer; the test frames are short ASCII.
+        frames.push({ data: message.toString('latin1').match(/frame-\d+/)?.[0] ?? '', isLast });
+      },
+    );
+
+    const sendFrames = (mockConnection: MockConnection, messageId: number, count: number, last = true) => {
+      for (let i = 0; i < count; i++) {
+        mockConnection.ws.send(
+          buildResultMessage(messageId, Buffer.from(`frame-${i}`), last && i === count - 1)
+        );
+      }
+    };
+
+    it('asks for frames and hands over every one in order, resolving after the last', async () => {
+      connection = new WebSocketConnection(server.url);
+      server.handler = (message, mockConnection) => sendFrames(mockConnection, message.messageId, 3);
+
+      const frames: Frame[] = [];
+      await queryStream('SELECT many', frames);
+
+      expect(frames).toEqual([
+        { data: 'frame-0', isLast: false },
+        { data: 'frame-1', isLast: false },
+        { data: 'frame-2', isLast: true },
+      ]);
+      expect(server.received.map((message) => message.stream)).toEqual([true]);
+    }, JEST_TIMEOUT);
+
+    it('takes the one frame of a Cube Store that does not stream as the last', async () => {
+      connection = new WebSocketConnection(server.url);
+      server.handler = (message, mockConnection) => sendFrames(mockConnection, message.messageId, 1);
+
+      const frames: Frame[] = [];
+      await queryStream('SELECT few', frames);
+
+      expect(frames).toEqual([{ data: 'frame-0', isLast: true }]);
+    }, JEST_TIMEOUT);
+
+    it('does not ask a plain query for frames', async () => {
+      connection = new WebSocketConnection(server.url);
+      server.handler = (message, mockConnection) => sendFrames(mockConnection, message.messageId, 1);
+
+      await query('SELECT 1');
+
+      expect(server.received.map((message) => message.stream)).toEqual([false]);
+    }, JEST_TIMEOUT);
+
+    it('rejects with an error that follows some frames', async () => {
+      connection = new WebSocketConnection(server.url);
+      server.handler = (message, mockConnection) => {
+        sendFrames(mockConnection, message.messageId, 2, false);
+        mockConnection.ws.send(buildErrorMessage(message.messageId, 'failed mid-stream'));
+      };
+
+      const frames: Frame[] = [];
+      await expect(queryStream('SELECT many', frames)).rejects.toThrow('failed mid-stream');
+
+      expect(frames.map((frame) => frame.isLast)).toEqual([false, false]);
+    }, JEST_TIMEOUT);
+
+    it('fails rather than re-sends a stream the connection dropped after it started', async () => {
+      connection = new WebSocketConnection(server.url);
+      server.handler = (message, mockConnection) => {
+        sendFrames(mockConnection, message.messageId, 2, false);
+        setTimeout(() => mockConnection.ws.terminate(), 100);
+      };
+
+      const frames: Frame[] = [];
+      const promise = queryStream('SELECT many', frames);
+      await expect(promise).rejects.toThrow(ConnectionError);
+      await expect(promise).rejects.toThrow('after 2 frame(s) of a streamed result');
+
+      expect(frames).toHaveLength(2);
+      expect(server.received).toHaveLength(1);
+    }, JEST_TIMEOUT);
+
+    it('re-sends a stream the connection dropped before its first frame', async () => {
+      connection = new WebSocketConnection(server.url);
+      server.handler = (message, mockConnection) => {
+        if (mockConnection.index === 0) {
+          mockConnection.ws.close();
+          return;
+        }
+        sendFrames(mockConnection, message.messageId, 2);
+      };
+
+      const frames: Frame[] = [];
+      await queryStream('SELECT many', frames);
+
+      expect(frames.map((frame) => frame.data)).toEqual(['frame-0', 'frame-1']);
+      expect(server.received.map((message) => message.connectionIndex)).toEqual([0, 1]);
+    }, JEST_TIMEOUT);
+  });
+
   it('rejects a query when the connection cannot be re-established', async () => {
     process.env.CUBEJS_CUBESTORE_MAX_CONNECT_RETRIES = '2';
 

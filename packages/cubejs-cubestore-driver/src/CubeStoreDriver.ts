@@ -15,6 +15,7 @@ import {
   IndexesSQL,
   QueryOptions,
   StreamingSourceTableData,
+  StreamOptions,
   StreamTableData,
   TableColumnQueryResult,
   TableStructure,
@@ -25,6 +26,7 @@ import fetch from 'node-fetch';
 
 import { ConnectionConfig } from './types';
 import { WebSocketConnection } from './WebSocketConnection';
+import { FrameRowStream } from './FrameRowStream';
 import { QueryResultFormat } from '../codegen';
 
 const CubeStoreCapabilityMinVersion = {
@@ -122,6 +124,29 @@ export class CubeStoreDriver extends BaseDriver implements DriverInterface {
         await this.hasCapability('arrowFormat') ? QueryResultFormat.Arrow : QueryResultFormat.Legacy
       ),
     });
+  }
+
+  /**
+   * Streams the rows of `query` as Cube Store sends them, in frames, instead of
+   * waiting for the whole result. A Cube Store that doesn't stream sends one
+   * frame, so this works against any version, buffering the result there.
+   */
+  public async stream(query: string, values: unknown[], options: StreamOptions): Promise<StreamTableData> {
+    const rowStream = new FrameRowStream();
+    const responseFormat = await this.hasCapability('arrowFormat') ? QueryResultFormat.Arrow : QueryResultFormat.Legacy;
+
+    this.connection.queryStream(
+      formatSql(query, values || []),
+      [],
+      {
+        inlineTables: [],
+        queryTracingObj: { requestId: options?.requestId, instance: getEnv('instanceId') },
+        responseFormat,
+      },
+      (frame, isLast) => rowStream.pushFrame(frame, isLast),
+    ).catch((error) => rowStream.destroy(error));
+
+    return { rowStream };
   }
 
   public async release() {

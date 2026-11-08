@@ -16,6 +16,8 @@ export interface ReceivedMessage {
   connectionIndex: number;
   messageId: number;
   query: string;
+  // The query asked for its result in several frames.
+  stream: boolean;
 }
 
 export interface MockConnection {
@@ -43,13 +45,14 @@ export function buildErrorMessage(messageId: number, error: string): Buffer {
 }
 
 /**
- * A successful answer. Its payload is decoded by the native result parser, so
- * tests that use it stub that parser out.
+ * A successful answer, or with `isLast` unset one frame of a streamed answer.
+ * Its payload is decoded by the native result parser, so tests that use it
+ * stub that parser out.
  */
-export function buildResultMessage(messageId: number, data: Buffer = Buffer.alloc(0)): Buffer {
+export function buildResultMessage(messageId: number, data: Buffer = Buffer.alloc(0), isLast: boolean = true): Buffer {
   const builder = new flatbuffers.Builder(1024);
   const dataOffset = HttpQueryResultArrow.createDataVector(builder, data);
-  const arrowOffset = HttpQueryResultArrow.createHttpQueryResultArrow(builder, dataOffset, true);
+  const arrowOffset = HttpQueryResultArrow.createHttpQueryResultArrow(builder, dataOffset, isLast);
   const commandOffset = HttpQueryResult.createHttpQueryResult(
     builder,
     HttpQueryResultData.HttpQueryResultArrow,
@@ -95,10 +98,12 @@ export class MockCubeStoreServer {
 
       ws.on('message', (raw: Buffer) => {
         const httpMessage = HttpMessage.getRootAsHttpMessage(new flatbuffers.ByteBuffer(raw));
+        const httpQuery = httpMessage.command(new HttpQuery()) as HttpQuery | null;
         const message: ReceivedMessage = {
           connectionIndex: connection.index,
           messageId: httpMessage.messageId(),
-          query: httpMessage.command(new HttpQuery())?.query() || '',
+          query: httpQuery?.query() || '',
+          stream: httpQuery?.stream() ?? false,
         };
         this.received.push(message);
         this.handler(message, connection);

@@ -15,6 +15,9 @@ import {
   HttpParameter,
   HttpParameterValue,
   HttpQuery,
+  HttpQueryResult,
+  HttpQueryResultArrow,
+  HttpQueryResultData,
   HttpTable,
   Int64Value,
   NullValue,
@@ -53,6 +56,12 @@ interface SentMessage {
   // How many connections died under this message from a failure that can't be
   // attributed to a single message. Used to give it exactly one more round.
   fatalRounds: number;
+  // Set for a streamed query: takes every frame of the result in order, the
+  // last one too, before the message resolves.
+  onFrame?: (message: Buffer, isLast: boolean) => void;
+  // Frames already handed to `onFrame`. A stream that got any can't be re-sent:
+  // Cube Store would start the result over.
+  frames?: number;
 }
 
 export type QueryParameter = null | boolean | number | string | Buffer;
@@ -61,7 +70,25 @@ export type WebSocketQueryOptions = {
   inlineTables?: InlineTable[];
   queryTracingObj?: any;
   responseFormat: QueryResultFormat;
+  // Ask for an Arrow result as several frames. Only `queryStream` reads them.
+  stream?: boolean;
 };
+
+/**
+ * Whether `httpMessage` ends its query's result: anything but an Arrow frame
+ * that says more follow. An older Cube Store, which doesn't stream, sends its
+ * one frame marked last.
+ */
+function isLastFrame(httpMessage: HttpMessage): boolean {
+  if (httpMessage.commandType() !== HttpCommand.HttpQueryResult) {
+    return true;
+  }
+  const result = httpMessage.command(new HttpQueryResult()) as HttpQueryResult | null;
+  if (result?.dataType() !== HttpQueryResultData.HttpQueryResultArrow) {
+    return true;
+  }
+  return (result.data(new HttpQueryResultArrow()) as HttpQueryResultArrow | null)?.isLast() ?? true;
+}
 
 interface CubeStoreWebSocket extends WebSocket {
   readyPromise: Promise<CubeStoreWebSocket>;
@@ -273,6 +300,19 @@ export class WebSocketConnection {
         webSocket.on('close', (code: number, reason: Buffer) => {
           webSocket.teardown();
 
+          // A streamed result that has started can't be asked for again: Cube
+          // Store would send it from the start, after rows the reader already has.
+          // eslint-disable-next-line no-restricted-syntax
+          for (const key of Object.keys(webSocket.sentMessages)) {
+            const sentMessage = webSocket.sentMessages[key];
+            if (sentMessage.frames) {
+              delete webSocket.sentMessages[key];
+              sentMessage.reject(new ConnectionError(
+                `Cube Store connection was closed after ${sentMessage.frames} frame(s) of a streamed result`
+              ));
+            }
+          }
+
           const pending = Object.keys(webSocket.sentMessages);
 
           if (pending.length) {
@@ -402,7 +442,20 @@ export class WebSocketConnection {
             return;
           }
 
+          if (resolver.onFrame && error === null && !isLastFrame(httpMessage)) {
+            resolver.frames = (resolver.frames ?? 0) + 1;
+            resolver.onFrame(msg, false);
+            return;
+          }
+
           delete webSocket.sentMessages[httpMessage.messageId()];
+
+          if (resolver.onFrame && error === null) {
+            resolver.onFrame(msg, true);
+            resolver.resolve(undefined);
+            this.closeIfDrained(webSocket);
+            return;
+          }
 
           if (error !== null) {
             resolver.reject(new QueryError(error));
@@ -433,7 +486,11 @@ export class WebSocketConnection {
     return 1000 * (this.currentConnectionTry + 1);
   }
 
-  private async sendMessage(messageId: number, buffer: Uint8Array): Promise<any> {
+  private async sendMessage(
+    messageId: number,
+    buffer: Uint8Array,
+    onFrame?: SentMessage['onFrame'],
+  ): Promise<any> {
     if (buffer.length > this.maxMessageSize) {
       // Cube Store would close the connection on such a message, which shows up
       // as an unrelated `write EPIPE`, so report it before sending anything.
@@ -450,7 +507,7 @@ export class WebSocketConnection {
 
     const socket = await this.initWebSocket();
     return new Promise((resolve, reject) => {
-      socket.sentMessages[messageId] = { resolve, reject, buffer, fatalRounds: 0 };
+      socket.sentMessages[messageId] = { resolve, reject, buffer, fatalRounds: 0, onFrame };
 
       // If socket is closing this message should be resent
       if (socket.readyState === WebSocket.OPEN) {
@@ -469,7 +526,7 @@ export class WebSocketConnection {
         // `messageId` is deliberately kept, like a re-send: Cube Store
         // de-duplicates on `(connection_id, message_id)`.
         delete socket.sentMessages[messageId];
-        this.sendMessage(messageId, buffer).then(resolve, reject);
+        this.sendMessage(messageId, buffer, onFrame).then(resolve, reject);
       }
     });
   }
@@ -551,7 +608,32 @@ export class WebSocketConnection {
   }
 
   public async query(query: string, parameters: QueryParameter[], options: WebSocketQueryOptions): Promise<any[]> {
-    const { inlineTables, queryTracingObj, responseFormat } = options;
+    const { messageId, buffer } = this.buildQueryMessage(query, parameters, options);
+    return this.sendMessage(messageId, buffer);
+  }
+
+  /**
+   * Runs `query` asking for a streamed Arrow result and hands each frame of it
+   * to `onFrame` as it arrives, the last one with `isLast` set. Resolves after
+   * the last frame and rejects on an error, which can come after some frames.
+   * Against a Cube Store that doesn't stream, the one frame is the last.
+   */
+  public async queryStream(
+    query: string,
+    parameters: QueryParameter[],
+    options: WebSocketQueryOptions,
+    onFrame: (message: Buffer, isLast: boolean) => void,
+  ): Promise<void> {
+    const { messageId, buffer } = this.buildQueryMessage(query, parameters, { ...options, stream: true });
+    await this.sendMessage(messageId, buffer, onFrame);
+  }
+
+  protected buildQueryMessage(
+    query: string,
+    parameters: QueryParameter[],
+    options: WebSocketQueryOptions,
+  ): { messageId: number, buffer: Uint8Array } {
+    const { inlineTables, queryTracingObj, responseFormat, stream } = options;
 
     const builder = new flatbuffers.Builder(1024);
     const queryOffset = builder.createString(query);
@@ -624,12 +706,16 @@ export class WebSocketConnection {
 
     HttpQuery.addResponseFormat(builder, responseFormat);
 
+    if (stream) {
+      HttpQuery.addStream(builder, true);
+    }
+
     const httpQueryOffset = HttpQuery.endHttpQuery(builder);
     const messageId = this.messageCounter++;
     const connectionIdOffset = builder.createString(this.connectionId);
     const message = HttpMessage.createHttpMessage(builder, messageId, HttpCommand.HttpQuery, httpQueryOffset, connectionIdOffset);
     builder.finish(message);
-    return this.sendMessage(messageId, builder.asUint8Array());
+    return { messageId, buffer: builder.asUint8Array() };
   }
 
   public async getCubeStoreVersion(): Promise<string> {

@@ -190,6 +190,34 @@ export class QueryQueue {
     return stream;
   }
 
+  /**
+   * Starts streaming `query` straight from the driver, without a queue, and
+   * returns the stream the rows arrive on. Errors, including ones after some
+   * rows, are raised on the stream.
+   */
+  protected streamSkipQueue(queryKey: QueryKey, query: QueryDef): QueryStream {
+    if (!this.streamHandler) {
+      throw new Error('Streaming queries aren\'t supported by this queue');
+    }
+
+    const queryKeyHash = this.redisHash(queryKey);
+    const stream = this.createQueryStream(queryKeyHash, query.aliasNameToMember ?? null);
+
+    this.streamHandler(query, stream)
+      .catch((error) => {
+        if (!stream.destroyed) {
+          stream.destroy(error);
+        }
+      })
+      .finally(() => {
+        if (this.streams.get(queryKeyHash) === stream) {
+          this.streams.delete(queryKeyHash);
+        }
+      });
+
+    return stream;
+  }
+
   // Zero is falsy, and a queueId is still checked for truthiness in a few places
   protected counter = 1;
 
@@ -240,7 +268,7 @@ export class QueryQueue {
         waitingForRequestId: queryDef.requestId
       });
       if (queryHandler === 'stream') {
-        throw new Error('Streaming queries to Cube Store aren\'t supported');
+        return this.streamSkipQueue(queryKey, query);
       }
       const result = await this.processQuerySkipQueue(queryDef, options.queueId);
       return this.parseResult(result);
