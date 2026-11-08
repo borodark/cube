@@ -1718,6 +1718,7 @@ impl<'a> HttpQuery<'a> {
     pub const VT_INLINE_TABLES: ::flatbuffers::VOffsetT = 8;
     pub const VT_PARAMETERS: ::flatbuffers::VOffsetT = 10;
     pub const VT_RESPONSE_FORMAT: ::flatbuffers::VOffsetT = 12;
+    pub const VT_STREAM: ::flatbuffers::VOffsetT = 14;
 
     #[inline]
     pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -1746,6 +1747,7 @@ impl<'a> HttpQuery<'a> {
         if let Some(x) = args.query {
             builder.add_query(x);
         }
+        builder.add_stream(args.stream);
         builder.add_response_format(args.response_format);
         builder.finish()
     }
@@ -1810,6 +1812,17 @@ impl<'a> HttpQuery<'a> {
                 .unwrap()
         }
     }
+    #[inline]
+    pub fn stream(&self) -> bool {
+        // Safety:
+        // Created from valid Table for this object
+        // which contains a valid value in this slot
+        unsafe {
+            self._tab
+                .get::<bool>(HttpQuery::VT_STREAM, Some(false))
+                .unwrap()
+        }
+    }
 }
 
 impl ::flatbuffers::Verifiable for HttpQuery<'_> {
@@ -1832,6 +1845,7 @@ impl ::flatbuffers::Verifiable for HttpQuery<'_> {
                 ::flatbuffers::Vector<'_, ::flatbuffers::ForwardsUOffset<HttpParameter>>,
             >>("parameters", Self::VT_PARAMETERS, false)?
             .visit_field::<QueryResultFormat>("response_format", Self::VT_RESPONSE_FORMAT, false)?
+            .visit_field::<bool>("stream", Self::VT_STREAM, false)?
             .finish();
         Ok(())
     }
@@ -1850,6 +1864,7 @@ pub struct HttpQueryArgs<'a> {
         >,
     >,
     pub response_format: QueryResultFormat,
+    pub stream: bool,
 }
 impl<'a> Default for HttpQueryArgs<'a> {
     #[inline]
@@ -1860,6 +1875,7 @@ impl<'a> Default for HttpQueryArgs<'a> {
             inline_tables: None,
             parameters: None,
             response_format: QueryResultFormat::Legacy,
+            stream: false,
         }
     }
 }
@@ -1910,6 +1926,11 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> HttpQueryBuilder<'a, 'b, A> {
         );
     }
     #[inline]
+    pub fn add_stream(&mut self, stream: bool) {
+        self.fbb_
+            .push_slot::<bool>(HttpQuery::VT_STREAM, stream, false);
+    }
+    #[inline]
     pub fn new(
         _fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>,
     ) -> HttpQueryBuilder<'a, 'b, A> {
@@ -1934,6 +1955,7 @@ impl ::core::fmt::Debug for HttpQuery<'_> {
         ds.field("inline_tables", &self.inline_tables());
         ds.field("parameters", &self.parameters());
         ds.field("response_format", &self.response_format());
+        ds.field("stream", &self.stream());
         ds.finish()
     }
 }

@@ -140,9 +140,6 @@ impl QueryResult {
         };
 
         cube_ext::spawn_blocking(move || -> Result<Vec<u8>, CubeError> {
-            use datafusion::arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
-            use std::io::Cursor;
-
             let (schema, batches) = match pending {
                 Pending::Frame(df) => {
                     let schema = df.get_schema();
@@ -152,34 +149,111 @@ impl QueryResult {
                 }
                 Pending::Batches { schema, batches } => (schema, batches),
             };
-
-            // Our arrow-rs fork advertises a non-standard `bitWidth` (64/96)
-            // in IPC schemas for `Decimal128` fields with precision <= 27, so
-            // parquet-embedded schemas and inter-node IPC stay readable by
-            // older CubeStore versions (cube-js/arrow-rs#48). The buffers
-            // still hold 16 bytes per value, and standard Arrow readers trust
-            // the advertised width: the JS orchestrator (upstream arrow)
-            // reads bitWidth 64 with an 8-byte stride — interleaving real
-            // values with zeros — and rejects bitWidth 96 outright. This
-            // stream only feeds standard readers, so write the honest width.
-            let options = IpcWriteOptions::default().with_standard_decimal_bit_width(true);
-            let mut writer = StreamWriter::try_new_with_options(
-                Cursor::new(Vec::new()),
-                schema.as_ref(),
-                options,
-            )?;
-
-            // Writes multiple batches, because it's Arrow IPC stream format, client should handle it
-            for batch in &batches {
-                writer.write(batch)?;
-            }
-
-            writer.finish()?;
-
-            Ok(writer.into_inner()?.into_inner())
+            arrow_ipc_stream(&schema, &batches)
         })
         .await?
     }
+
+    /// The result as a sequence of Arrow IPC streams of about `frame_bytes`
+    /// each, for a client that reads it frame by frame. Every item is a
+    /// complete stream with its own schema header, and there is always at
+    /// least one, so an empty result still carries its schema.
+    pub fn into_arrow_ipc_frames(
+        self,
+        frame_bytes: usize,
+    ) -> BoxStream<'static, Result<Vec<u8>, CubeError>> {
+        match self {
+            QueryResult::Frame(df) => Box::pin(async_stream::try_stream! {
+                let total = df.get_rows().len();
+                let mut start = 0;
+                let mut rows_per_frame = FIRST_FRAME_ROWS;
+                loop {
+                    let end = total.min(start + rows_per_frame);
+                    let frame_df = df.clone();
+                    let frame = cube_ext::spawn_blocking(move || -> Result<Vec<u8>, CubeError> {
+                        let schema = frame_df.get_schema();
+                        let arrays = data::rows_to_columns(
+                            frame_df.get_columns(),
+                            &frame_df.get_rows()[start..end],
+                        );
+                        let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+                        arrow_ipc_stream(&schema, &[batch])
+                    })
+                    .await??;
+                    rows_per_frame = next_frame_rows(frame_bytes, frame.len(), end - start);
+                    start = end;
+                    yield frame;
+                    if start >= total {
+                        break;
+                    }
+                }
+            }),
+            QueryResult::Stream {
+                schema,
+                mut batches,
+            } => Box::pin(async_stream::try_stream! {
+                let mut pending = Vec::new();
+                let mut pending_bytes = 0;
+                let mut sent_any = false;
+                while let Some(batch) = batches.try_next().await? {
+                    pending_bytes += batch.get_array_memory_size();
+                    pending.push(batch);
+                    if pending_bytes >= frame_bytes {
+                        let frame_schema = schema.clone();
+                        let frame_batches = std::mem::take(&mut pending);
+                        pending_bytes = 0;
+                        sent_any = true;
+                        yield cube_ext::spawn_blocking(move || {
+                            arrow_ipc_stream(&frame_schema, &frame_batches)
+                        })
+                        .await??;
+                    }
+                }
+                if !pending.is_empty() || !sent_any {
+                    yield cube_ext::spawn_blocking(move || arrow_ipc_stream(&schema, &pending))
+                        .await??;
+                }
+            }),
+        }
+    }
+}
+
+/// Rows in the first frame of a result read from a [DataFrame], before the
+/// size of a row is known.
+const FIRST_FRAME_ROWS: usize = 4096;
+
+/// Rows for the next frame, so it comes out at about `frame_bytes`, judged by
+/// how large the last one came out.
+fn next_frame_rows(frame_bytes: usize, last_bytes: usize, last_rows: usize) -> usize {
+    let row_bytes = (last_bytes / last_rows.max(1)).max(1);
+    (frame_bytes / row_bytes).max(1)
+}
+
+fn arrow_ipc_stream(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>, CubeError> {
+    use datafusion::arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
+    use std::io::Cursor;
+
+    // Our arrow-rs fork advertises a non-standard `bitWidth` (64/96)
+    // in IPC schemas for `Decimal128` fields with precision <= 27, so
+    // parquet-embedded schemas and inter-node IPC stay readable by
+    // older CubeStore versions (cube-js/arrow-rs#48). The buffers
+    // still hold 16 bytes per value, and standard Arrow readers trust
+    // the advertised width: the JS orchestrator (upstream arrow)
+    // reads bitWidth 64 with an 8-byte stride — interleaving real
+    // values with zeros — and rejects bitWidth 96 outright. This
+    // stream only feeds standard readers, so write the honest width.
+    let options = IpcWriteOptions::default().with_standard_decimal_bit_width(true);
+    let mut writer =
+        StreamWriter::try_new_with_options(Cursor::new(Vec::new()), schema.as_ref(), options)?;
+
+    // Writes multiple batches, because it's Arrow IPC stream format, client should handle it
+    for batch in batches {
+        writer.write(batch)?;
+    }
+
+    writer.finish()?;
+
+    Ok(writer.into_inner()?.into_inner())
 }
 
 impl std::fmt::Debug for QueryResult {

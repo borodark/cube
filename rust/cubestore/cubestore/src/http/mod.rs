@@ -43,7 +43,7 @@ use tempfile::NamedTempFile;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +70,16 @@ const CONNECTION_EVICTED_CLOSE_CODE: u16 = 1013;
 /// keeps the frame in our buffer indefinitely — and a close frame is a handful
 /// of bytes, so a peer that cannot take them within this long is not going to.
 const EVICTED_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// About how large each frame of a streamed result is: small enough to stay
+/// well under a client's message size limit, large enough that framing costs
+/// nothing next to the data.
+const STREAM_FRAME_BYTES: usize = 8 << 20;
+
+/// Frames of one streamed result that may wait for the WebSocket at once. The
+/// query only computes the next frame once a slot frees, so a slow client holds
+/// up its own result rather than filling the server's memory.
+const STREAM_FRAMES_IN_FLIGHT: usize = 2;
 
 /// How long a caller waits for the connection counter's lock before giving up.
 ///
@@ -682,6 +692,20 @@ impl HttpServer {
                 let (sql_service, messages_state) = service.as_ref();
                 let sql_service = sql_service.clone();
                 let messages_state = messages_state.clone();
+                if command.is_streamed_query() {
+                    // Frames go out as they are made, so unlike other results a
+                    // streamed one isn't kept for a client that reconnects and
+                    // sends the same message again: that one runs the query anew.
+                    cube_ext::spawn(HttpServer::send_streamed_query(
+                        sql_service,
+                        sql_query_context,
+                        message_id,
+                        connection_id,
+                        command,
+                        sender,
+                    ));
+                    return Ok(());
+                }
                 if connection_id.is_some() {
                     cube_ext::spawn(async move {
                         let key = (connection_id.clone(), message_id);
@@ -999,6 +1023,7 @@ impl HttpServer {
                 trace_obj,
                 parameters,
                 response_format,
+                ..
             } => {
                 let query_result = sql_service
                     .exec_query_with_context(
@@ -1022,7 +1047,11 @@ impl HttpServer {
                             Ok(HttpCommand::QueryResultCompleted)
                         } else {
                             let data = query_result.to_arrow_ipc_stream().await?;
-                            Ok(HttpCommand::QueryResultArrow { data })
+                            Ok(HttpCommand::QueryResultArrow {
+                                data,
+                                is_last: true,
+                                slot: FrameSlot::default(),
+                            })
                         }
                     }
                     other => Err(CubeError::user(format!(
@@ -1032,6 +1061,139 @@ impl HttpServer {
                 }
             }
             x => Err(CubeError::user(format!("Unexpected command: {:?}", x))),
+        }
+    }
+
+    /// Runs a query that asked for a streamed Arrow result and sends the result
+    /// to `sender` frame by frame, the last one with `is_last` set. An error,
+    /// before the first frame or between two, goes out as an error for the same
+    /// message. Stops without a word once `sender` is closed.
+    pub async fn send_streamed_query(
+        sql_service: Arc<dyn SqlService>,
+        sql_query_context: SqlQueryContext,
+        message_id: u32,
+        connection_id: Option<String>,
+        command: HttpCommand,
+        sender: Sender<Arc<HttpMessage>>,
+    ) {
+        let query_text = match &command {
+            HttpCommand::Query { query, .. } => query.clone(),
+            _ => String::new(),
+        };
+        let res = Self::stream_query(
+            sql_service,
+            sql_query_context,
+            command,
+            STREAM_FRAME_BYTES,
+            |command| {
+                let message = Arc::new(HttpMessage {
+                    message_id,
+                    connection_id: connection_id.clone(),
+                    command,
+                });
+                let sender = sender.clone();
+                async move { sender.send(message).await.is_ok() }
+            },
+        )
+        .await;
+        let Err(e) = res else {
+            return;
+        };
+        let level = if is_rate_limit_error(&e) {
+            log::Level::Warn
+        } else {
+            log::Level::Error
+        };
+        log::log!(
+            level,
+            "Error streaming HTTP query (connection_id={}): {}\nThe query: {:?}",
+            connection_id.as_deref().unwrap_or("(None)"),
+            e.display_with_backtrace(),
+            query_text,
+        );
+        let command = if e.is_wrong_connection() {
+            HttpCommand::CloseConnection {
+                error: e.to_string(),
+            }
+        } else {
+            HttpCommand::Error {
+                error: e.to_string(),
+            }
+        };
+        let message = HttpMessage {
+            message_id,
+            connection_id,
+            command,
+        };
+        if !sender.is_closed() {
+            if let Err(e) = sender.send(Arc::new(message)).await {
+                error!("Websocket send result channel error: {:?}", e);
+            }
+        }
+    }
+
+    /// Runs `command` and hands each reply to `send`, which says whether it
+    /// went out. Arrow frames come out at about `frame_bytes`. Each one waits for one of [STREAM_FRAMES_IN_FLIGHT]
+    /// slots before it is computed, and the next one is computed before this one
+    /// goes, to tell whether it is the last.
+    pub async fn stream_query<F, Fut>(
+        sql_service: Arc<dyn SqlService>,
+        sql_query_context: SqlQueryContext,
+        command: HttpCommand,
+        frame_bytes: usize,
+        send: F,
+    ) -> Result<(), CubeError>
+    where
+        F: Fn(HttpCommand) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let HttpCommand::Query {
+            query,
+            inline_tables,
+            trace_obj,
+            parameters,
+            ..
+        } = command
+        else {
+            return Err(CubeError::internal(format!(
+                "Only queries can be streamed, got: {:?}",
+                command
+            )));
+        };
+        let query_result = sql_service
+            .exec_query_with_context(
+                sql_query_context
+                    .with_trace_obj(trace_obj)
+                    .with_inline_tables(&inline_tables)
+                    .with_parameters(&parameters),
+                &query,
+            )
+            .await?;
+        if query_result.schema().fields().is_empty() {
+            send(HttpCommand::QueryResultCompleted).await;
+            return Ok(());
+        }
+        let slots = Arc::new(Semaphore::new(STREAM_FRAMES_IN_FLIGHT));
+        let mut frames = query_result.into_arrow_ipc_frames(frame_bytes).peekable();
+        loop {
+            let slot = slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| CubeError::internal(e.to_string()))?;
+            let Some(data) = frames.next().await.transpose()? else {
+                return Ok(());
+            };
+            let is_last = std::pin::Pin::new(&mut frames).peek().await.is_none();
+            let sent = send(HttpCommand::QueryResultArrow {
+                data,
+                is_last,
+                slot: FrameSlot(Some(Arc::new(slot))),
+            })
+            .await;
+            if !sent || is_last {
+                return Ok(());
+            }
         }
     }
 
@@ -1073,6 +1235,36 @@ pub struct HttpMessage {
     connection_id: Option<String>,
 }
 
+/// One of a streamed result's [STREAM_FRAMES_IN_FLIGHT] slots, held by a frame
+/// until the WebSocket writer has sent it and dropped the message.
+#[derive(Clone, Default)]
+pub struct FrameSlot(#[allow(dead_code)] Option<Arc<OwnedSemaphorePermit>>);
+
+impl HttpCommand {
+    fn is_streamed_query(&self) -> bool {
+        matches!(
+            self,
+            HttpCommand::Query {
+                stream: true,
+                response_format: QueryResultFormat::Arrow,
+                ..
+            }
+        )
+    }
+}
+
+impl PartialEq for FrameSlot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for FrameSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrameSlot")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HttpCommand {
     Query {
@@ -1081,6 +1273,8 @@ pub enum HttpCommand {
         trace_obj: Option<String>,
         parameters: Option<QueryParameters>,
         response_format: QueryResultFormat,
+        /// Send an Arrow result as several frames rather than one.
+        stream: bool,
     },
     ResultSet {
         data_frame: Arc<DataFrame>,
@@ -1090,6 +1284,10 @@ pub enum HttpCommand {
         /// RecordBatch messages following the schema header; consumers must
         /// decode it with a streaming IPC reader.
         data: Vec<u8>,
+        /// The final frame of the result. Only streamed results have others.
+        is_last: bool,
+        /// Keeps a streamed result's frame slot taken until the frame is sent.
+        slot: FrameSlot,
     },
     /// Command completed without a result set (zero columns) — e.g. CREATE
     /// TABLE/INSERT or queue/cache writes. Only produced for Arrow-format
@@ -1126,6 +1324,7 @@ impl HttpMessage {
                     trace_obj,
                     parameters,
                     response_format,
+                    stream,
                 } => {
                     let query_offset = builder.create_string(&query);
                     let trace_obj_offset = trace_obj.as_ref().map(|o| builder.create_string(o));
@@ -1147,20 +1346,19 @@ impl HttpMessage {
                                 trace_obj: trace_obj_offset,
                                 parameters: None,
                                 response_format: *response_format,
+                                stream: *stream,
                             },
                         )
                         .as_union_value(),
                     )
                 }
-                HttpCommand::QueryResultArrow { data } => {
+                HttpCommand::QueryResultArrow { data, is_last, .. } => {
                     let payload = builder.create_vector(data);
                     let arrow_table = HttpQueryResultArrow::create(
                         &mut builder,
                         &HttpQueryResultArrowArgs {
                             data: Some(payload),
-                            // We don't support streaming for now, but clients should implement it
-                            // according to the protocol specification
-                            is_last: true,
+                            is_last: *is_last,
                         },
                     );
                     Some(
@@ -1422,6 +1620,7 @@ impl HttpMessage {
                         inline_tables,
                         parameters,
                         response_format: query.response_format(),
+                        stream: query.stream(),
                     }
                 }
                 cubeshared::codegen::HttpCommand::HttpResultSet => {
@@ -1775,6 +1974,7 @@ mod tests {
                 trace_obj: Some("test trace".to_string()),
                 parameters: None,
                 response_format: QueryResultFormat::Legacy,
+                stream: false,
             },
             connection_id: Some("foo".to_string()),
         };
@@ -1846,6 +2046,7 @@ mod tests {
                 trace_obj: None,
                 parameters: None,
                 response_format: QueryResultFormat::Legacy,
+                stream: false,
             },
         );
         let args = HttpMessageArgs {
@@ -1872,6 +2073,7 @@ mod tests {
                     trace_obj: None,
                     parameters: None,
                     response_format: QueryResultFormat::Legacy,
+                    stream: false,
                 },
                 connection_id: Some("foo".to_string()),
             }
@@ -1952,11 +2154,12 @@ mod tests {
                 trace_obj: None,
                 parameters: None,
                 response_format: QueryResultFormat::Arrow,
+                stream: false,
             },
         )
         .await?;
         let arrow_bytes = match resp {
-            HttpCommand::QueryResultArrow { data } => data,
+            HttpCommand::QueryResultArrow { data, .. } => data,
             other => panic!("expected QueryResultArrow, got: {:?}", other),
         };
 
@@ -1965,6 +2168,8 @@ mod tests {
             message_id: 99,
             command: HttpCommand::QueryResultArrow {
                 data: arrow_bytes.clone(),
+                is_last: true,
+                slot: FrameSlot::default(),
             },
             connection_id: None,
         }
@@ -1997,6 +2202,411 @@ mod tests {
         Ok(())
     }
 
+    /// Answers every query with a stream of `batches` integer batches of
+    /// `rows` rows, failing in place of the batch at `fail_at`, if given.
+    struct BatchStreamService {
+        batches: usize,
+        rows: usize,
+        fail_at: Option<usize>,
+    }
+    crate::di_service!(BatchStreamService, [SqlService]);
+    #[async_trait]
+    impl SqlService for BatchStreamService {
+        async fn exec_query(&self, _q: &str) -> Result<QueryResult, CubeError> {
+            unimplemented!("Mock")
+        }
+        async fn exec_query_with_context(
+            &self,
+            _ctx: SqlQueryContext,
+            _q: &str,
+        ) -> Result<QueryResult, CubeError> {
+            use datafusion::arrow::array::Int64Array;
+            use datafusion::arrow::datatypes::{DataType, Field, Schema};
+            use datafusion::arrow::record_batch::RecordBatch;
+
+            let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+            let (batches, rows, fail_at) = (self.batches, self.rows, self.fail_at);
+            let batch_schema = schema.clone();
+            let batches = futures::stream::iter((0..batches).map(move |i| {
+                if Some(i) == fail_at {
+                    return Err(CubeError::user("failed mid-stream".to_string()));
+                }
+                let values = (i * rows..(i + 1) * rows).map(|n| n as i64);
+                Ok(RecordBatch::try_new(
+                    batch_schema.clone(),
+                    vec![Arc::new(Int64Array::from_iter_values(values))],
+                )?)
+            }));
+            Ok(QueryResult::Stream {
+                schema,
+                batches: Box::pin(batches),
+            })
+        }
+        async fn plan_query(&self, _q: &str) -> Result<QueryPlans, CubeError> {
+            unimplemented!("Mock")
+        }
+        async fn plan_query_with_context(
+            &self,
+            _ctx: SqlQueryContext,
+            _q: &str,
+        ) -> Result<QueryPlans, CubeError> {
+            unimplemented!("Mock")
+        }
+        async fn upload_temp_file(
+            &self,
+            _ctx: SqlQueryContext,
+            _name: String,
+            _path: &Path,
+        ) -> Result<(), CubeError> {
+            unimplemented!("Mock")
+        }
+        async fn temp_uploads_dir(&self, _ctx: SqlQueryContext) -> Result<String, CubeError> {
+            unimplemented!("Mock")
+        }
+    }
+
+    fn streamed_query() -> HttpCommand {
+        arrow_query(true)
+    }
+
+    fn arrow_query(stream: bool) -> HttpCommand {
+        HttpCommand::Query {
+            query: "select n".to_string(),
+            inline_tables: vec![],
+            trace_obj: None,
+            parameters: None,
+            response_format: QueryResultFormat::Arrow,
+            stream,
+        }
+    }
+
+    /// A DataFrame of `rows` rows: an integer counting up and a string.
+    fn counting_frame(rows: usize) -> Arc<DataFrame> {
+        let columns = vec![
+            Column::new("n".to_string(), ColumnType::Int, 0),
+            Column::new("s".to_string(), ColumnType::String, 1),
+        ];
+        let rows = (0..rows)
+            .map(|n| {
+                Row::new(vec![
+                    TableValue::Int(n as i64),
+                    TableValue::String(format!("row {}", n)),
+                ])
+            })
+            .collect();
+        Arc::new(DataFrame::new(columns, rows))
+    }
+
+    /// Every reply `stream_query` hands over, each frame's slot freed as it is
+    /// recorded, as the WebSocket writer frees it once the frame is sent.
+    async fn stream_replies(
+        service: Arc<dyn SqlService>,
+        frame_bytes: usize,
+    ) -> (Result<(), CubeError>, Vec<HttpCommand>) {
+        let replies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let res = HttpServer::stream_query(
+            service,
+            SqlQueryContext::default(),
+            streamed_query(),
+            frame_bytes,
+            |command| {
+                let command = match command {
+                    HttpCommand::QueryResultArrow { data, is_last, .. } => {
+                        HttpCommand::QueryResultArrow {
+                            data,
+                            is_last,
+                            slot: FrameSlot::default(),
+                        }
+                    }
+                    other => other,
+                };
+                replies.lock().unwrap().push(command);
+                async { true }
+            },
+        )
+        .await;
+        let replies = std::mem::take(&mut *replies.lock().unwrap());
+        (res, replies)
+    }
+
+    /// The `n` column of every row in an Arrow frame, which must be a whole
+    /// IPC stream with its own schema.
+    fn frame_values(data: &[u8]) -> Vec<i64> {
+        use datafusion::arrow::array::{Array, Int64Array};
+        use datafusion::arrow::ipc::reader::StreamReader;
+
+        let reader = StreamReader::try_new(std::io::Cursor::new(data), None).unwrap();
+        assert_eq!(reader.schema().field(0).name(), "n");
+        let mut values = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            values.extend((0..column.len()).map(|i| column.value(i)));
+        }
+        values
+    }
+
+    fn arrow_frames(replies: &[HttpCommand]) -> Vec<(Vec<i64>, bool)> {
+        replies
+            .iter()
+            .map(|reply| match reply {
+                HttpCommand::QueryResultArrow { data, is_last, .. } => {
+                    (frame_values(data), *is_last)
+                }
+                other => panic!("expected QueryResultArrow, got: {:?}", other),
+            })
+            .collect()
+    }
+
+    /// A result larger than a frame goes out as several frames, each readable
+    /// on its own, in order, with only the last one marked last.
+    #[tokio::test]
+    async fn streamed_query_sends_frames_until_the_last() -> Result<(), CubeError> {
+        let rows = 50_000;
+        let service = Arc::new(StubService(counting_frame(rows)));
+        let (res, replies) = stream_replies(service, 64 << 10).await;
+        res?;
+
+        let frames = arrow_frames(&replies);
+        assert!(
+            frames.len() > 2,
+            "expected several frames, got {}",
+            frames.len()
+        );
+        let last = frames.len() - 1;
+        for (i, (_, is_last)) in frames.iter().enumerate() {
+            assert_eq!(*is_last, i == last, "is_last of frame {}", i);
+        }
+        let values: Vec<i64> = frames.into_iter().flat_map(|(values, _)| values).collect();
+        assert_eq!(values, (0..rows as i64).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// Batches from a streamed query result are grouped into frames of about
+    /// the frame size, not sent one frame per batch.
+    #[tokio::test]
+    async fn streamed_query_groups_batches_into_frames() -> Result<(), CubeError> {
+        let service = Arc::new(BatchStreamService {
+            batches: 100,
+            rows: 1000,
+            fail_at: None,
+        });
+        // A batch holds 8 KB of values, so 64 KB frames take 8 of them.
+        let (res, replies) = stream_replies(service, 64 << 10).await;
+        res?;
+
+        let frames = arrow_frames(&replies);
+        assert!(
+            (10..=20).contains(&frames.len()),
+            "expected about 13 frames, got {}",
+            frames.len()
+        );
+        assert!(frames.last().unwrap().1);
+        let values: Vec<i64> = frames.into_iter().flat_map(|(values, _)| values).collect();
+        assert_eq!(values, (0..100_000).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    /// A small result is one frame marked last, the same reply a query that
+    /// doesn't stream gets.
+    #[tokio::test]
+    async fn streamed_query_small_result_is_one_frame() -> Result<(), CubeError> {
+        let df = counting_frame(10);
+        let (res, replies) = stream_replies(Arc::new(StubService(df.clone())), 64 << 10).await;
+        res?;
+        let one_shot = HttpServer::process_command(
+            Arc::new(StubService(df)),
+            SqlQueryContext::default(),
+            arrow_query(false),
+        )
+        .await?;
+        assert_eq!(replies.len(), 1);
+        match (&replies[0], one_shot) {
+            (
+                HttpCommand::QueryResultArrow { data, is_last, .. },
+                HttpCommand::QueryResultArrow {
+                    data: one_shot_data,
+                    ..
+                },
+            ) => {
+                assert!(is_last);
+                assert_eq!(*data, one_shot_data);
+            }
+            other => panic!("expected two QueryResultArrow, got: {:?}", other),
+        }
+        Ok(())
+    }
+
+    /// An empty result still sends one frame, so the client gets the schema.
+    #[tokio::test]
+    async fn streamed_query_empty_result_sends_the_schema() -> Result<(), CubeError> {
+        for service in [
+            Arc::new(StubService(counting_frame(0))) as Arc<dyn SqlService>,
+            Arc::new(BatchStreamService {
+                batches: 0,
+                rows: 0,
+                fail_at: None,
+            }),
+        ] {
+            let (res, replies) = stream_replies(service, 64 << 10).await;
+            res?;
+            assert_eq!(arrow_frames(&replies), vec![(vec![], true)]);
+        }
+        Ok(())
+    }
+
+    /// An error between frames ends the stream with that error, after the
+    /// frames that were ready, and none marked last.
+    #[tokio::test]
+    async fn streamed_query_error_mid_stream() -> Result<(), CubeError> {
+        let service = Arc::new(BatchStreamService {
+            batches: 100,
+            rows: 1000,
+            fail_at: Some(50),
+        });
+        let (res, replies) = stream_replies(service, 64 << 10).await;
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("failed mid-stream"), "{}", err);
+        let frames = arrow_frames(&replies);
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|(_, is_last)| !is_last));
+        Ok(())
+    }
+
+    /// Frames the client hasn't taken hold their slots, and the query waits for
+    /// one to free before it computes more.
+    #[tokio::test]
+    async fn streamed_query_waits_for_frames_to_be_sent() -> Result<(), CubeError> {
+        let service = Arc::new(StubService(counting_frame(50_000)));
+        let (tx, mut rx) = mpsc::channel::<HttpCommand>(100);
+        let stream = cube_ext::spawn(HttpServer::stream_query(
+            service,
+            SqlQueryContext::default(),
+            streamed_query(),
+            64 << 10,
+            move |command| {
+                let tx = tx.clone();
+                async move { tx.send(command).await.is_ok() }
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut held = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            held.push(command);
+        }
+        assert_eq!(held.len(), STREAM_FRAMES_IN_FLIGHT);
+        assert!(!stream.is_finished());
+
+        // Sending a frame drops it, which frees its slot.
+        drop(held);
+        let mut frames = 0;
+        while let Some(command) = rx.recv().await {
+            frames += 1;
+            if let HttpCommand::QueryResultArrow { is_last: true, .. } = command {
+                break;
+            }
+        }
+        stream.await.unwrap()?;
+        assert!(frames > STREAM_FRAMES_IN_FLIGHT);
+        Ok(())
+    }
+
+    /// Once a frame can't be sent the query stops: no more frames, no error.
+    #[tokio::test]
+    async fn streamed_query_stops_when_the_client_is_gone() -> Result<(), CubeError> {
+        let service = Arc::new(StubService(counting_frame(50_000)));
+        let calls = AtomicU64::new(0);
+        HttpServer::stream_query(
+            service,
+            SqlQueryContext::default(),
+            streamed_query(),
+            64 << 10,
+            |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { false }
+            },
+        )
+        .await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Over the WebSocket, a query that asks to stream gets its frames as
+    /// separate messages with the same id, the last marked last; one that
+    /// doesn't gets a single message.
+    #[tokio::test]
+    async fn ws_streamed_query_test() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let mut auth = MockSqlAuthService::new();
+        auth.expect_authenticate().return_const(Ok(None));
+        // Enough rows that the 8 MB frames divide them.
+        let rows = 600_000;
+        let http_server = Arc::new(HttpServer::new(
+            "127.0.0.1:53037".to_string(),
+            Arc::new(auth),
+            Arc::new(StubService(counting_frame(rows))),
+            Duration::from_millis(100),
+            Duration::from_millis(10000),
+            Duration::from_millis(1000),
+            64 << 20,
+            64 << 20,
+            0, // no websocket connection cap
+        ));
+        {
+            let http_server = http_server.clone();
+            cube_ext::spawn(async move { http_server.run_server().await });
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let (mut socket, _) = connect_async(Url::parse("ws://127.0.0.1:53037/ws").unwrap())
+            .await
+            .unwrap();
+        for (message_id, stream) in [(1, true), (2, false)] {
+            socket
+                .send(Message::binary(
+                    HttpMessage {
+                        message_id,
+                        command: arrow_query(stream),
+                        connection_id: Some("foo".to_string()),
+                    }
+                    .bytes(),
+                ))
+                .await
+                .unwrap();
+            let mut values = Vec::new();
+            let mut frames = 0;
+            loop {
+                let msg = socket.next().await.unwrap().unwrap().into_data();
+                let msg = root_as_http_message(&msg).unwrap();
+                assert_eq!(msg.message_id(), message_id);
+                let arrow = msg
+                    .command_as_http_query_result()
+                    .and_then(|result| result.data_as_http_query_result_arrow())
+                    .expect("an HttpQueryResultArrow reply");
+                let data: Vec<u8> = arrow.data().iter().collect();
+                frames += 1;
+                values.extend(frame_values(&data));
+                if arrow.is_last() {
+                    break;
+                }
+            }
+            assert_eq!(values, (0..rows as i64).collect::<Vec<_>>());
+            if stream {
+                assert!(frames > 1, "expected several frames, got {}", frames);
+            } else {
+                assert_eq!(frames, 1);
+            }
+        }
+
+        http_server.stop_processing().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn arrow_response_format_zero_columns_completed() -> Result<(), CubeError> {
         use cubeshared::codegen::{root_as_http_message, HttpQueryResultData};
@@ -2016,6 +2626,7 @@ mod tests {
                 trace_obj: None,
                 parameters: None,
                 response_format: QueryResultFormat::Arrow,
+                stream: false,
             },
         )
         .await?;
@@ -2157,6 +2768,7 @@ mod tests {
                             trace_obj: None,
                             parameters: None,
                             response_format: QueryResultFormat::Legacy,
+                            stream: false,
                         },
                         connection_id,
                     }
@@ -2493,6 +3105,7 @@ mod tests {
                         trace_obj: None,
                         parameters: None,
                         response_format: QueryResultFormat::Legacy,
+                        stream: false,
                     },
                     connection_id: Some("foo".to_string()),
                 }
@@ -2572,6 +3185,7 @@ mod tests {
                         trace_obj: None,
                         parameters: None,
                         response_format: QueryResultFormat::Legacy,
+                        stream: false,
                     },
                     connection_id: Some("foo".to_string()),
                 }
@@ -2647,6 +3261,7 @@ mod tests {
                         trace_obj: None,
                         parameters: None,
                         response_format: QueryResultFormat::Legacy,
+                        stream: false,
                     },
                     connection_id: Some("foo".to_string()),
                 }
@@ -2687,6 +3302,7 @@ mod tests {
                         trace_obj: None,
                         parameters: None,
                         response_format: QueryResultFormat::Legacy,
+                        stream: false,
                     },
                     connection_id: Some("foo".to_string()),
                 }

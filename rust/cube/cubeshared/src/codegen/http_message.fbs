@@ -35,6 +35,9 @@ table HttpQuery {
     inline_tables: [HttpTable];
     parameters: [HttpParameter];
     response_format: QueryResultFormat = Legacy;
+    // Asks for an Arrow result as several HttpQueryResultArrow frames, the last
+    // one with is_last set. Servers that don't know the field send one frame.
+    stream: bool = false;
 }
 
 table HttpTable {
