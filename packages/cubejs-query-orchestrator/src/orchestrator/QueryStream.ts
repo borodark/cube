@@ -1,5 +1,5 @@
 import * as stream from 'stream';
-import { getEnv } from '@cubejs-backend/shared';
+import { arrowFrameObject, getArrowFrame, getEnv } from '@cubejs-backend/shared';
 
 export class QueryStream extends stream.Transform {
   private timeout = 5 * 60 * 1000;
@@ -42,6 +42,13 @@ export class QueryStream extends stream.Transform {
   public _transform(chunk: Record<string, unknown>, encoding: BufferEncoding, callback: stream.TransformCallback) {
     if (this.streams.has(this.queryKey)) {
       this.streams.delete(this.queryKey);
+    }
+    // A frame of rows goes on as it is, with how its rows would be renamed
+    const frame = getArrowFrame(chunk);
+    if (frame) {
+      this.debounce();
+      callback(null, arrowFrameObject({ ...frame, aliasNameToMember: this.aliasNameToMember }));
+      return;
     }
     let row: Record<string, unknown> = {};
     if (this.aliasNameToMember) {

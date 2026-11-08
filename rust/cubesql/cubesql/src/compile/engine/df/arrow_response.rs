@@ -9,6 +9,11 @@
 //! feeding the same builders [`FieldValue`]s made straight from the Arrow
 //! values ([`arrow_field_values`]), or by computing the result directly for
 //! the common cases ([`convert_arrow_column`]).
+//!
+//! A streamed response is read differently: there every value reaches the
+//! builders as the text the orchestrator writes for it, numbers included.
+//! [`arrow_text_values`] and [`convert_arrow_column_as_text`] are the same pair
+//! for that path.
 
 use crate::{compile::engine::df::scan::FieldValue, CubeError};
 use chrono::{DateTime, NaiveDateTime};
@@ -166,6 +171,78 @@ pub fn convert_arrow_column(
     };
 
     Ok(converted)
+}
+
+/// `array` converted to `data_type` as its text would be, for the cases
+/// computed directly. Text holds an integer's every digit, so integers go into
+/// `Int64` exactly, not through `f64`. Text that isn't a whole number reads as
+/// NULL into an integer, where a number would be rounded, so floats and
+/// unsigned integers that may not fit are left to [`arrow_text_values`]. The
+/// other cases of [`convert_arrow_column`] read a value's text as it reads the
+/// value.
+pub fn convert_arrow_column_as_text(
+    array: &ArrayRef,
+    data_type: &DataType,
+) -> Result<Option<ArrayRef>, CubeError> {
+    macro_rules! to_int64 {
+        ($ty:ty) => {{
+            let a = array.as_any().downcast_ref::<$ty>().expect("its own type");
+            Ok(Some(Arc::new(
+                a.iter().map(|v| v.map(i64::from)).collect::<Int64Array>(),
+            )))
+        }};
+    }
+
+    match (array.data_type(), data_type) {
+        (DataType::Int64, DataType::Int64) => Ok(Some(array.clone())),
+        (DataType::Int8, DataType::Int64) => to_int64!(Int8Array),
+        (DataType::Int16, DataType::Int64) => to_int64!(Int16Array),
+        (DataType::Int32, DataType::Int64) => to_int64!(Int32Array),
+        (DataType::UInt8, DataType::Int64) => to_int64!(UInt8Array),
+        (DataType::UInt16, DataType::Int64) => to_int64!(UInt16Array),
+        (DataType::UInt32, DataType::Int64) => to_int64!(UInt32Array),
+        (_, DataType::Int64) => Ok(None),
+        _ => convert_arrow_column(array, data_type),
+    }
+}
+
+/// The values of `array` as the text the orchestrator writes for them in a
+/// streamed response, or `None` for an array type it has no conversion for
+/// here. Text is what that response holds for every value but a null.
+pub fn arrow_text_values<'a>(
+    array: &'a ArrayRef,
+) -> Option<Box<dyn Iterator<Item = Result<FieldValue<'a>, CubeError>> + 'a>> {
+    let len = array.len();
+
+    macro_rules! texts {
+        ($ty:ty, |$v:ident| $text:expr) => {{
+            let a = array.as_any().downcast_ref::<$ty>()?;
+            Box::new((0..len).map(move |i| {
+                Ok(if a.is_null(i) {
+                    FieldValue::Null
+                } else {
+                    let $v = a.value(i);
+                    FieldValue::String(Cow::Owned($text))
+                })
+            }))
+        }};
+    }
+
+    Some(match array.data_type() {
+        DataType::Int8 => texts!(Int8Array, |v| v.to_string()),
+        DataType::Int16 => texts!(Int16Array, |v| v.to_string()),
+        DataType::Int32 => texts!(Int32Array, |v| v.to_string()),
+        DataType::Int64 => texts!(Int64Array, |v| v.to_string()),
+        DataType::UInt8 => texts!(UInt8Array, |v| v.to_string()),
+        DataType::UInt16 => texts!(UInt16Array, |v| v.to_string()),
+        DataType::UInt32 => texts!(UInt32Array, |v| v.to_string()),
+        DataType::UInt64 => texts!(UInt64Array, |v| v.to_string()),
+        DataType::Float32 => texts!(Float32Array, |v| (v as f64).to_string()),
+        DataType::Float64 => texts!(Float64Array, |v| v.to_string()),
+        DataType::Boolean => texts!(BooleanArray, |v| v.to_string()),
+        // The rest are text in both responses
+        _ => arrow_field_values(array)?,
+    })
 }
 
 /// The values of `array` as the [`FieldValue`]s the orchestrator's generic
@@ -882,5 +959,348 @@ mod tests {
             columns[0].as_any().downcast_ref::<Int64Array>().unwrap(),
             &Int64Array::from(vec![Some(1), None, Some(3)])
         );
+    }
+
+    mod stream {
+        use super::super::*;
+        use crate::compile::engine::df::scan::{
+            deserialize_arrow_chunk, deserialize_columnar_chunk, deserialize_text_chunk,
+            stream_column_names, MemberField,
+        };
+        use datafusion::{
+            arrow::{
+                array::{DecimalBuilder, TimestampMicrosecondArray},
+                datatypes::{Field, Schema},
+                record_batch::RecordBatch,
+            },
+            scalar::ScalarValue,
+        };
+        use std::collections::HashMap;
+
+        fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
+            Arc::new(Schema::new(
+                fields
+                    .iter()
+                    .map(|(name, data_type)| Field::new(name, data_type.clone(), true))
+                    .collect(),
+            ))
+        }
+
+        /// What the rows of a chunk become today: JS writes each value's text
+        /// into a JSON chunk, which cubesql reads.
+        fn from_json(
+            names: &[&str],
+            texts: &[Vec<Option<&str>>],
+            schema: SchemaRef,
+            member_fields: &[MemberField],
+        ) -> Result<RecordBatch, String> {
+            let chunk = serde_json::json!({ "members": names, "columns": texts });
+            deserialize_columnar_chunk(chunk.to_string().as_bytes(), schema, member_fields, 0)
+                .map_err(|e| e.to_string())
+        }
+
+        fn same(expected: &Result<RecordBatch, String>, actual: &Result<RecordBatch, String>) {
+            match (expected, actual) {
+                (Ok(expected), Ok(actual)) => {
+                    assert_eq!(expected.schema(), actual.schema());
+                    for i in 0..expected.num_columns() {
+                        assert_eq!(
+                            expected.column(i).data(),
+                            actual.column(i).data(),
+                            "column {} differs: {:?} vs {:?}",
+                            i,
+                            expected.column(i),
+                            actual.column(i)
+                        );
+                    }
+                }
+                (Err(expected), Err(actual)) => assert_eq!(expected, actual),
+                _ => panic!("expected {:?}, got {:?}", expected, actual),
+            }
+        }
+
+        /// The Arrow column `array`, whose values the orchestrator writes as
+        /// `texts`, reads into each of `data_types` as those texts do.
+        fn assert_same(array: ArrayRef, texts: &[Option<&str>], data_types: &[DataType]) {
+            let read_texts: Vec<Option<String>> = arrow_text_values(&array)
+                .expect("a supported type")
+                .map(|v| match v.unwrap() {
+                    FieldValue::String(s) => Some(s.into_owned()),
+                    FieldValue::Null => None,
+                    other => panic!("expected text, got {:?}", other),
+                })
+                .collect();
+            assert_eq!(
+                read_texts,
+                texts
+                    .iter()
+                    .map(|t| t.map(String::from))
+                    .collect::<Vec<_>>()
+            );
+
+            for data_type in data_types {
+                let schema = schema(&[("m", data_type.clone())]);
+                let member_fields = [MemberField::regular("m".to_string())];
+                let expected = from_json(&["m"], &[texts.to_vec()], schema.clone(), &member_fields);
+
+                let names = ["m".to_string()];
+                let arrow = deserialize_arrow_chunk(
+                    &names,
+                    &[array.clone()],
+                    schema.clone(),
+                    &member_fields,
+                )
+                .map_err(|e| e.to_string());
+                same(&expected, &arrow);
+
+                let text = deserialize_text_chunk(
+                    &names,
+                    vec![read_texts.clone()],
+                    schema,
+                    &member_fields,
+                )
+                .map_err(|e| e.to_string());
+                same(&expected, &text);
+            }
+        }
+
+        fn all_types() -> Vec<DataType> {
+            vec![
+                DataType::Utf8,
+                DataType::Int16,
+                DataType::Int32,
+                DataType::Int64,
+                DataType::UInt64,
+                DataType::Float32,
+                DataType::Float64,
+                DataType::Boolean,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Date32,
+                DataType::Decimal(10, 2),
+                DataType::Decimal(38, 10),
+            ]
+        }
+
+        #[test]
+        fn integers() {
+            let big = (1i64 << 53) + 1;
+            let big_text = big.to_string();
+            assert_same(
+                Arc::new(Int64Array::from(vec![
+                    Some(0),
+                    Some(-7),
+                    Some(1),
+                    None,
+                    Some(big),
+                    Some(i64::MAX),
+                ])),
+                &[
+                    Some("0"),
+                    Some("-7"),
+                    Some("1"),
+                    None,
+                    Some(&big_text),
+                    Some("9223372036854775807"),
+                ],
+                &all_types(),
+            );
+            assert_same(
+                Arc::new(Int32Array::from(vec![Some(42), None, Some(-1)])),
+                &[Some("42"), None, Some("-1")],
+                &all_types(),
+            );
+        }
+
+        #[test]
+        fn unsigned_integers() {
+            assert_same(
+                Arc::new(UInt64Array::from(vec![Some(u64::MAX), Some(3), None])),
+                &[Some("18446744073709551615"), Some("3"), None],
+                &all_types(),
+            );
+        }
+
+        #[test]
+        fn floats() {
+            let values = [1.0, -1.5, 0.1, 1e300, 2.5, f64::INFINITY, 1e-7];
+            let texts: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            let mut array: Vec<Option<f64>> = values.iter().map(|v| Some(*v)).collect();
+            array.push(None);
+            let mut expected: Vec<Option<&str>> = texts.iter().map(|t| Some(t.as_str())).collect();
+            expected.push(None);
+            assert_same(Arc::new(Float64Array::from(array)), &expected, &all_types());
+
+            let text = (1.1f32 as f64).to_string();
+            assert_same(
+                Arc::new(Float32Array::from(vec![Some(1.1f32), None])),
+                &[Some(&text), None],
+                &all_types(),
+            );
+        }
+
+        #[test]
+        fn booleans_and_strings() {
+            assert_same(
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])),
+                &[Some("true"), Some("false"), None],
+                &all_types(),
+            );
+            assert_same(
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some(""),
+                    None,
+                    Some("2024-01-15T10:30:45.123"),
+                    Some("12"),
+                    Some("true"),
+                ])),
+                &[
+                    Some("a"),
+                    Some(""),
+                    None,
+                    Some("2024-01-15T10:30:45.123"),
+                    Some("12"),
+                    Some("true"),
+                ],
+                &all_types(),
+            );
+        }
+
+        #[test]
+        fn decimals() {
+            let mut builder = DecimalBuilder::new(4, 18, 2);
+            builder.append_value(12345).unwrap();
+            builder.append_value(-5).unwrap();
+            builder.append_value(100).unwrap();
+            builder.append_null().unwrap();
+            assert_same(
+                Arc::new(builder.finish()),
+                &[Some("123.45"), Some("-0.05"), Some("1"), None],
+                &all_types(),
+            );
+        }
+
+        #[test]
+        fn timestamps() {
+            // 2024-01-15T10:30:45.123456
+            let micros = 1_705_314_645_123_456;
+            assert_same(
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(micros),
+                    None,
+                    Some(0),
+                ])),
+                &[
+                    Some("2024-01-15T10:30:45.123"),
+                    None,
+                    Some("1970-01-01T00:00:00.000"),
+                ],
+                &all_types(),
+            );
+        }
+
+        /// Columns are found by the member their alias stands for, as the
+        /// rows' keys are renamed; an alias without one becomes `undefined`,
+        /// a name given twice keeps its last column, a member missing from the
+        /// chunk reads as NULLs, and a literal is a literal.
+        #[test]
+        fn names_columns_as_rows_key_them() {
+            let aliases: Vec<String> = ["orders__status", "orders__count", "extra", "dup"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let alias_to_member: HashMap<String, String> = [
+                ("orders__status", "Orders.status"),
+                ("orders__count", "Orders.count"),
+                ("dup", "Orders.status"),
+            ]
+            .iter()
+            .map(|(a, m)| (a.to_string(), m.to_string()))
+            .collect();
+            let names = stream_column_names(&aliases, Some(&alias_to_member));
+            assert_eq!(
+                names,
+                vec![
+                    "Orders.status",
+                    "Orders.count",
+                    "undefined",
+                    "Orders.status"
+                ]
+            );
+            assert_eq!(stream_column_names(&aliases, None), aliases);
+
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(StringArray::from(vec![Some("new"), Some("done")])),
+                Arc::new(Int64Array::from(vec![Some(3), None])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("y")])),
+                Arc::new(StringArray::from(vec![Some("last"), None])),
+            ];
+            let schema = schema(&[
+                ("status", DataType::Utf8),
+                ("count", DataType::Int64),
+                ("missing", DataType::Float64),
+                ("literal", DataType::Utf8),
+            ]);
+            let member_fields = [
+                MemberField::regular("Orders.status".to_string()),
+                MemberField::regular("Orders.count".to_string()),
+                MemberField::regular("Orders.missing".to_string()),
+                MemberField::Literal(ScalarValue::Utf8(Some("lit".to_string()))),
+            ];
+
+            // The object JS builds per row: `Orders.status` where it first
+            // appears, holding the value set last.
+            let expected = from_json(
+                &["Orders.status", "Orders.count", "undefined"],
+                &[
+                    vec![Some("last"), None],
+                    vec![Some("3"), None],
+                    vec![Some("x"), Some("y")],
+                ],
+                schema.clone(),
+                &member_fields,
+            );
+            let arrow = deserialize_arrow_chunk(&names, &columns, schema.clone(), &member_fields)
+                .map_err(|e| e.to_string());
+            same(&expected, &arrow);
+            assert_eq!(
+                arrow.unwrap().column(0).data(),
+                StringArray::from(vec![Some("last"), None]).data()
+            );
+
+            let texts: Vec<Vec<Option<String>>> = columns
+                .iter()
+                .map(|c| {
+                    arrow_text_values(c)
+                        .unwrap()
+                        .map(|v| match v.unwrap() {
+                            FieldValue::String(s) => Some(s.into_owned()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect();
+            let text = deserialize_text_chunk(&names, texts, schema, &member_fields)
+                .map_err(|e| e.to_string());
+            same(&expected, &text);
+        }
+
+        #[test]
+        fn rejects_mismatched_names() {
+            let schema = schema(&[("m", DataType::Utf8)]);
+            let err = deserialize_arrow_chunk(
+                &[],
+                &[Arc::new(StringArray::from(vec!["a"])) as ArrayRef],
+                schema,
+                &[MemberField::regular("m".to_string())],
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("1 columns, but 0 names"),
+                "{}",
+                err
+            );
+        }
     }
 }

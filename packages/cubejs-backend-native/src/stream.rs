@@ -1,6 +1,12 @@
+use cubeorchestrator::query_message_parser::QueryResult;
+use cubeorchestrator::query_result_transform::DBResponsePrimitive;
+use cubesql::compile::engine::df::arrow_response::read_arrow_ipc;
 use cubesql::compile::engine::df::scan::{
-    deserialize_columnar_chunk, MemberField, RecordBatch, SchemaRef,
+    deserialize_arrow_chunk, deserialize_columnar_chunk, deserialize_text_chunk,
+    stream_column_names, MemberField, RecordBatch, SchemaRef,
 };
+
+use std::collections::HashMap;
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -177,6 +183,10 @@ impl JsWriteStream {
         let chunk = bind_method(cx, chunk_fn, obj_this)?;
         obj.set(cx, "chunk", chunk)?;
 
+        let arrow_chunk_fn = JsFunction::new(cx, js_stream_push_arrow_chunk)?;
+        let arrow_chunk = bind_method(cx, arrow_chunk_fn, obj_this)?;
+        obj.set(cx, "arrowChunk", arrow_chunk)?;
+
         let start_fn = JsFunction::new(cx, js_stream_start)?;
         let start_stream = bind_method(cx, start_fn, obj_this)?;
         obj.set(cx, "start", start_stream)?;
@@ -208,6 +218,64 @@ impl JsWriteStream {
             )?;
             drop(chunk);
             rows_hint.store(batch.num_rows(), Ordering::Relaxed);
+
+            sender
+                .send(Some(Ok(batch)))
+                .await
+                .map_err(|e| CubeError::internal(format!("Can't send to channel: {}", e)))
+        }
+    }
+
+    /// Pushes a frame of a streamed Cube Store result, the whole message as
+    /// Cube Store sent it, in place of the rows it holds. Its columns are named
+    /// as the rows would have been keyed (`alias_to_member`), and they read
+    /// into the same batch. A frame whose Arrow this version can't read is
+    /// read through the orchestrator's values instead, as text, as the rows
+    /// hold them.
+    fn push_arrow_chunk(
+        &self,
+        message: Vec<u8>,
+        alias_to_member: Option<HashMap<String, String>>,
+    ) -> impl Future<Output = Result<(), CubeError>> {
+        let sender = self.sender.clone();
+        let schema = self.schema.clone();
+        let member_fields = self.member_fields.clone();
+        async move {
+            let result = QueryResult::from_cubestore_fb(&message)
+                .map_err(|e| CubeError::internal(e.to_string()))?;
+            drop(message);
+            let names = stream_column_names(result.members(), alias_to_member.as_ref());
+
+            let arrow = match result.arrow_ipc() {
+                Some(ipc) => read_arrow_ipc(ipc)?
+                    .filter(|(_, columns)| columns.len() == names.len())
+                    .map(|(_, columns)| columns),
+                None => None,
+            };
+            let batch = match arrow {
+                Some(columns) => deserialize_arrow_chunk(&names, &columns, schema, &member_fields)?,
+                None => {
+                    let columns = (0..names.len())
+                        .map(|idx| {
+                            result.column(idx).map(|values| {
+                                values
+                                    .iter()
+                                    .map(|value| match value {
+                                        DBResponsePrimitive::Null => None,
+                                        other => Some(other.to_string()),
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| CubeError::internal(e.to_string()))?;
+                    deserialize_text_chunk(&names, columns, schema, &member_fields)?
+                }
+            };
+            // Rows are sent in chunks only once there are some
+            if batch.num_rows() == 0 {
+                return Ok(());
+            }
 
             sender
                 .send(Some(Ok(batch)))
@@ -283,6 +351,32 @@ fn js_stream_push_chunk(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let chunk = cx.argument::<JsBuffer>(0)?.as_slice(&cx).to_vec();
 
     let future = this.push_chunk(chunk);
+    wait_for_future_and_execute_callback(this.tokio_handle.clone(), cx.channel(), callback, future);
+
+    Ok(cx.undefined())
+}
+
+fn js_stream_push_arrow_chunk(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    #[cfg(feature = "neon-debug")]
+    trace!("JsWriteStream.push_arrow_chunk");
+
+    let this = cx
+        .this::<JsValue>()?
+        .downcast_or_throw::<JsBox<JsWriteStream>, _>(&mut cx)?;
+    let message = cx.argument::<JsBuffer>(0)?.as_slice(&cx).to_vec();
+    let alias_to_member = match cx.argument_opt(1) {
+        Some(value) if value.is_a::<JsString, _>(&mut cx) => {
+            let json = value
+                .downcast_or_throw::<JsString, _>(&mut cx)?
+                .value(&mut cx);
+            serde_json::from_str::<Option<HashMap<String, String>>>(&json)
+                .or_else(|e| cx.throw_error(format!("Can't parse alias map: {}", e)))?
+        }
+        _ => None,
+    };
+    let callback = cx.argument::<JsFunction>(2)?.root(&mut cx);
+
+    let future = this.push_arrow_chunk(message, alias_to_member);
     wait_for_future_and_execute_callback(this.tokio_handle.clone(), cx.channel(), callback, future);
 
     Ok(cx.undefined())

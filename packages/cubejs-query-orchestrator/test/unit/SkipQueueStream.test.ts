@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { Readable } from 'stream';
 import type { QueryKey } from '@cubejs-backend/base-driver';
+import { arrowFrameObject, getArrowFrame } from '@cubejs-backend/shared';
 
 import { QueryQueue } from '../../src';
 import type { QueryStream } from '../../src/orchestrator/QueryStream';
@@ -67,6 +68,16 @@ describe('QueryQueue with skipQueue, streamed queries', () => {
     expect(streamed[0]).toEqual({ 'Orders.status': 's0', 'Orders.count': 0 });
     expect(streamed[69_999]).toEqual({ 'Orders.status': 's0', 'Orders.count': 69_999 });
     expect(streamHandler).toHaveBeenCalledWith(payload, expect.anything());
+  });
+
+  test('passes frames on as they are, with how their rows would be renamed', async () => {
+    const data = Buffer.from('frame');
+    const queue = createQueue(piping(() => Readable.from([arrowFrameObject({ data })])));
+    const aliasNameToMember = { orders__count: 'Orders.count' };
+
+    const streamed = await readAll(await queue.executeInQueue('stream', key('SELECT frames'), { aliasNameToMember }));
+
+    expect(streamed.map(getArrowFrame)).toEqual([{ data, aliasNameToMember }]);
   });
 
   test('raises an error that follows some rows on the stream', async () => {

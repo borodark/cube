@@ -2478,6 +2478,8 @@ class ApiGateway {
         context,
         persistent: true,
         forceNoCache: true,
+        // The SQL API reads Cube Store results as Arrow frames
+        arrowFrames: getEnv('cubesqlArrowPassthrough'),
       };
       const _stream = {
         originalQuery: query,
@@ -2687,6 +2689,8 @@ class ApiGateway {
           context,
           persistent: true,
           forceNoCache: true,
+          // The SQL API reads Cube Store results as Arrow frames
+          arrowFrames: getEnv('cubesqlArrowPassthrough'),
         };
 
         const adapterApi = await this.getAdapterApi(context);

@@ -38,4 +38,5 @@ export * from './log-redaction';
 export * from './pool';
 export * from './sql-escape';
 export * from './object-shape';
+export * from './arrow-frame';
 export * from './request-id';

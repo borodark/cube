@@ -130,10 +130,15 @@ export class CubeStoreDriver extends BaseDriver implements DriverInterface {
    * Streams the rows of `query` as Cube Store sends them, in frames, instead of
    * waiting for the whole result. A Cube Store that doesn't stream sends one
    * frame, so this works against any version, buffering the result there.
+   *
+   * With `options.arrowFrames`, the stream carries the frames themselves,
+   * marked as frame objects, for a reader that takes Arrow.
    */
   public async stream(query: string, values: unknown[], options: StreamOptions): Promise<StreamTableData> {
-    const rowStream = new FrameRowStream();
     const responseFormat = await this.hasCapability('arrowFormat') ? QueryResultFormat.Arrow : QueryResultFormat.Legacy;
+    const rowStream = new FrameRowStream({
+      frames: Boolean(options?.arrowFrames) && responseFormat === QueryResultFormat.Arrow,
+    });
 
     this.connection.queryStream(
       formatSql(query, values || []),

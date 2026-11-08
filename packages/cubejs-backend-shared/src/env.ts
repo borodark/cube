@@ -2306,6 +2306,8 @@ const variables: Record<string, (...args: any) => any> = {
   convertTzForRawTimeDimension: () => get('CUBESQL_SQL_PUSH_DOWN').default('true').asBoolStrict(),
   // Read by cubesql too: whether pushed down SQL may read Cube Store pre-aggregations
   sqlPushDownPreAggregations: () => get('CUBESQL_SQL_PUSH_DOWN_PRE_AGGREGATIONS').default('true').asBoolStrict(),
+  // Read by cubesql too: whether Cube Store results reach the SQL API as Arrow
+  cubesqlArrowPassthrough: () => get('CUBESQL_ARROW_PASSTHROUGH').default('false').asBool(),
   // Deprecated section
 
   // Support for Redis as queue & cache driver was removed in 0.36

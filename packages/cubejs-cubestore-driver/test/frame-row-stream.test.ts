@@ -1,5 +1,7 @@
 import { parseCubestoreResultMessage } from '@cubejs-backend/native';
 
+import { getArrowFrame } from '@cubejs-backend/shared';
+
 import { FrameRowStream } from '../src/FrameRowStream';
 
 // Decoding a frame is the native addon's job; here a frame is the JSON of its rows.
@@ -83,6 +85,19 @@ describe('FrameRowStream', () => {
     stream.pushFrame(Buffer.from('"bad"'), true);
 
     await expect(readAll(stream)).rejects.toThrow('not an Arrow frame');
+  });
+
+  it('hands over the frames themselves, in order, to a reader that takes them', async () => {
+    const stream = new FrameRowStream({ frames: true });
+    const read = readAll(stream);
+    stream.pushFrame(frame(0, 2), false);
+    await tick();
+    stream.pushFrame(frame(2, 1), true);
+
+    const frames = (await read).map((object) => getArrowFrame(object)?.data);
+
+    expect(frames).toEqual([frame(0, 2), frame(2, 1)]);
+    expect(parse).not.toHaveBeenCalled();
   });
 
   it('drops frames that arrive after the reader gave up', async () => {

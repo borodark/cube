@@ -136,6 +136,12 @@ export type StreamOptions = {
    * database job/query for tracing (e.g. BigQuery job labels).
    */
   requestId?: string;
+  /**
+   * The reader takes a result that arrives as Arrow frame by frame as those
+   * frames (see `ARROW_FRAME` in `@cubejs-backend/shared`) in place of rows.
+   * Only a driver whose source sends such frames reads it.
+   */
+  arrowFrames?: boolean;
 };
 
 export type StreamingSourceOptions = {

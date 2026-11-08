@@ -1,5 +1,7 @@
 use crate::compile::date_parser::parse_date_str;
-use crate::compile::engine::df::arrow_response::{arrow_field_values, convert_arrow_column};
+use crate::compile::engine::df::arrow_response::{
+    arrow_field_values, arrow_text_values, convert_arrow_column, convert_arrow_column_as_text,
+};
 use crate::{
     compile::{
         engine::df::wrapper::{CubeScanWrappedSqlNode, CubeScanWrapperNode, SqlQuery},
@@ -53,6 +55,7 @@ use std::str::FromStr;
 use std::{
     any::Any,
     borrow::Cow,
+    collections::HashMap,
     fmt::{self, Display},
     sync::Arc,
     task::{Context, Poll},
@@ -1559,6 +1562,137 @@ pub fn deserialize_columnar_chunk(
         })?;
 
     state.finish()
+}
+
+/// The names a streamed response's rows are keyed by, for its columns named
+/// `aliases`: the member each alias stands for, as the orchestrator's
+/// `QueryStream` renames them, or the alias itself without `alias_to_member`.
+/// An alias it doesn't name becomes `undefined`, as it does there.
+pub fn stream_column_names(
+    aliases: &[String],
+    alias_to_member: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    match alias_to_member {
+        Some(map) => aliases
+            .iter()
+            .map(|alias| {
+                map.get(alias)
+                    .cloned()
+                    .unwrap_or_else(|| "undefined".to_string())
+            })
+            .collect(),
+        None => aliases.to_vec(),
+    }
+}
+
+/// The columns a row keyed by `names` keeps, as a JavaScript object does:
+/// each name once, where it first appears, holding the column it was last
+/// given. Returns the names and, for each, the index of that column.
+fn row_columns(names: &[String]) -> (Vec<String>, Vec<usize>) {
+    let mut kept: Vec<String> = Vec::with_capacity(names.len());
+    let mut columns: Vec<usize> = Vec::with_capacity(names.len());
+    for (idx, name) in names.iter().enumerate() {
+        match kept.iter().position(|k| k == name) {
+            Some(pos) => columns[pos] = idx,
+            None => {
+                kept.push(name.clone());
+                columns.push(idx);
+            }
+        }
+    }
+
+    (kept, columns)
+}
+
+/// Reads a streamed response's chunk that arrived as Arrow, `columns` named by
+/// `names` (see [`stream_column_names`]), into the batch the rows it stands for
+/// would have become: the same as [`deserialize_columnar_chunk`] reading those
+/// rows, where every value is the orchestrator's text for it.
+pub fn deserialize_arrow_chunk(
+    names: &[String],
+    columns: &[ArrayRef],
+    schema: SchemaRef,
+    member_fields: &[MemberField],
+) -> std::result::Result<RecordBatch, CubeError> {
+    check_member_fields(&schema, member_fields)?;
+    if names.len() != columns.len() {
+        return Err(CubeError::internal(format!(
+            "Arrow chunk has {} columns, but {} names for them",
+            columns.len(),
+            names.len()
+        )));
+    }
+    let rows = columns.first().map(|c| c.len()).unwrap_or(0);
+    let (names, column_idx) = row_columns(names);
+
+    let mut arrays = Vec::with_capacity(schema.fields().len());
+    for (schema_field, member_field) in schema.fields().iter().zip(member_fields) {
+        let data_type = schema_field.data_type();
+        if data_type == &DataType::Null {
+            arrays.push(Arc::new(NullArray::new(rows)) as ArrayRef);
+            continue;
+        }
+
+        let column = match member_field {
+            MemberField::Member(member) => names
+                .iter()
+                .position(|n| n == &member.field_name)
+                .map(|pos| &columns[column_idx[pos]]),
+            MemberField::Literal(_) => None,
+        };
+        if let Some(column) = column {
+            if let Some(array) = convert_arrow_column_as_text(column, data_type)? {
+                arrays.push(array);
+                continue;
+            }
+        }
+
+        let mut builder = ColumnBuilder::try_new(data_type, rows)?;
+        match (member_field, column) {
+            (MemberField::Member(member), Some(column)) => {
+                let values = arrow_text_values(column).ok_or_else(|| {
+                    CubeError::internal(format!(
+                        "Unable to read Arrow column of type {} for '{}'",
+                        column.data_type(),
+                        member.field_name
+                    ))
+                })?;
+                builder.append_column(values)?;
+            }
+            // A missing field is treated as a column of NULLs
+            (MemberField::Member(_), None) => builder.append_nulls(rows)?,
+            (MemberField::Literal(value), _) => builder.append_literal(value, rows)?,
+        }
+        arrays.push(builder.finish());
+    }
+
+    Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+/// Reads a streamed response's chunk given as the text of each value, `None`
+/// for a null, `columns` named by `names` (see [`stream_column_names`]), as
+/// [`deserialize_columnar_chunk`] reads the rows they stand for.
+pub fn deserialize_text_chunk(
+    names: &[String],
+    columns: Vec<Vec<Option<String>>>,
+    schema: SchemaRef,
+    member_fields: &[MemberField],
+) -> std::result::Result<RecordBatch, CubeError> {
+    let (names, column_idx) = row_columns(names);
+    let mut columns: Vec<Option<Vec<Option<String>>>> = columns.into_iter().map(Some).collect();
+    let columns = column_idx
+        .into_iter()
+        .map(|idx| {
+            columns[idx]
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.map(Value::String).unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect();
+    let mut response = JsonColumnarValueObject::try_new(names, columns)?;
+    transform_response(&mut response, schema, member_fields)
 }
 
 /// Every schema field is read through the member field at the same index.

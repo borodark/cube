@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { Writable } from 'stream';
 import type { Request as ExpressRequest } from 'express';
-import { CacheMode } from '@cubejs-backend/shared';
+import { CacheMode, getArrowFrame } from '@cubejs-backend/shared';
 import { NativeQueryResultRef, ResultWrapper } from './ResultWrapper';
 import { ColumnarChunkBuilder } from './ColumnarChunkBuilder';
 
@@ -332,6 +332,31 @@ function wrapNativeFunctionWithStream(
           objectMode: true,
           highWaterMark: chunkLength,
           write(row: any, encoding: BufferEncoding, callback: (error?: (Error | null)) => void) {
+            // A frame of a Cube Store result as Arrow, in place of its rows. Rows
+            // gathered before it go first, to keep the order.
+            const frame = getArrowFrame(row);
+            if (frame) {
+              const sendFrame = (err?: any) => {
+                if (err) {
+                  callback(err);
+                } else {
+                  writerOrChannel.arrowChunk(
+                    frame.data,
+                    JSON.stringify(frame.aliasNameToMember ?? null),
+                    callback,
+                  );
+                }
+              };
+              if (chunkBuilder.isEmpty()) {
+                sendFrame();
+              } else {
+                const toSend = chunkBuilder.toBuffer();
+                chunkBuilder.reset();
+                writerOrChannel.chunk(toSend, sendFrame);
+              }
+              return;
+            }
+
             chunkBuilder.push(row);
             if (chunkBuilder.count() < chunkLength) {
               callback(null);

@@ -110,6 +110,11 @@ export type Query = {
 export type QueryBody = {
   dataSource?: string;
   persistent?: boolean;
+  /**
+   * The reader of a streamed (`persistent`) query takes a result that arrives
+   * as Arrow frames as those frames, in place of rows (see `ARROW_FRAME`).
+   */
+  arrowFrames?: boolean;
   query?: string;
   values?: string[];
   loadRefreshKeysOnly?: boolean;
@@ -351,6 +356,7 @@ export class QueryCache {
             useCsvQuery: queryBody.useCsvQuery,
             lambdaTypes: queryBody.lambdaTypes,
             aliasNameToMember: queryBody.aliasNameToMember,
+            arrowFrames: queryBody.arrowFrames,
             primaryQuery: true,
           }
         );
@@ -671,6 +677,7 @@ export class QueryCache {
       lambdaTypes,
       persistent,
       aliasNameToMember,
+      arrowFrames,
       renewCycle,
       primaryQuery,
     }: {
@@ -685,6 +692,7 @@ export class QueryCache {
       lambdaTypes?: TableStructure,
       persistent?: boolean,
       aliasNameToMember?: { [alias: string]: string } | null,
+      arrowFrames?: boolean,
       renewCycle?: boolean,
       primaryQuery?: boolean,
     }
@@ -717,6 +725,7 @@ export class QueryCache {
       return queue.executeInQueue('stream', cacheKey as QueryKey, {
         ..._query,
         aliasNameToMember,
+        arrowFrames,
       }, priority, opt);
     }
   }
@@ -893,7 +902,11 @@ export class QueryCache {
           let logged = false;
           Promise
             .all([clientFactory()])
-            .then(([client]) => (<DriverInterface>client).stream(traceFn(req), req.values, { highWaterMark: getEnv('dbQueryStreamHighWaterMark'), requestId: req.requestId }))
+            .then(([client]) => (<DriverInterface>client).stream(traceFn(req), req.values, {
+              highWaterMark: getEnv('dbQueryStreamHighWaterMark'),
+              requestId: req.requestId,
+              arrowFrames: req.arrowFrames,
+            }))
             .then((source) => {
               const cleanup = async (error?: Error) => {
                 if (source.release) {

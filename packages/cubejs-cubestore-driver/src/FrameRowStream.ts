@@ -1,5 +1,6 @@
 import { Readable } from 'stream';
 import { parseCubestoreResultMessage, ResultRow } from '@cubejs-backend/native';
+import { arrowFrameObject } from '@cubejs-backend/shared';
 
 /**
  * The rows of a streamed Cube Store result, read frame by frame as they arrive.
@@ -7,6 +8,10 @@ import { parseCubestoreResultMessage, ResultRow } from '@cubejs-backend/native';
  * A frame stays a compact Arrow message until the reader asks for more rows:
  * only then is it decoded, one frame at a time, so a slow reader holds frames
  * rather than every row of them.
+ *
+ * With `frames` set, a reader that takes Arrow (the SQL API) gets each frame
+ * as it is instead, marked as a frame object (`ARROW_FRAME`), and nothing is
+ * decoded here at all.
  */
 export class FrameRowStream extends Readable {
   protected readonly frames: Buffer[] = [];
@@ -17,7 +22,7 @@ export class FrameRowStream extends Readable {
 
   protected wanted = false;
 
-  public constructor() {
+  public constructor(protected readonly options: { frames?: boolean } = {}) {
     super({ objectMode: true });
   }
 
@@ -59,6 +64,16 @@ export class FrameRowStream extends Readable {
       if (this.lastFrameReceived) {
         this.push(null);
       }
+      return;
+    }
+
+    if (this.options.frames) {
+      this.wanted = false;
+      if (this.push(arrowFrameObject({ data: frame }))) {
+        this.wanted = true;
+        this.decodeNext();
+      }
+
       return;
     }
 
